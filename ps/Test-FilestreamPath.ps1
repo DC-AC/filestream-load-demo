@@ -30,7 +30,14 @@ Import-Module (Join-Path $ScriptDir 'FsPoc.Common.psm1') -Force
 
 $cfg = Get-FsPocConfig -Path $ConfigPath
 $step = 0
-function Step { param([string] $Name) $script:step++; Write-Host ''; Write-Host ("[$script:step] $Name") -ForegroundColor Cyan }
+$currentStep = '(startup)'
+function Step {
+    param([string] $Name)
+    $script:step++
+    $script:currentStep = $Name
+    Write-Host ''
+    Write-Host ("[$script:step] $Name") -ForegroundColor Cyan
+}
 function Detail { param([string] $Text, [string] $Colour = 'Gray') Write-Host "      $Text" -ForegroundColor $Colour }
 function Report-NonFatal {
     # Informational steps report and continue. Only the streaming test itself
@@ -45,7 +52,7 @@ function Report-NonFatal {
 function Explain {
     param([System.Exception] $Ex)
     Write-Host ''
-    Write-Host '  FAILED HERE' -ForegroundColor Red
+    Write-Host ("  FAILED during: {0}" -f $script:currentStep) -ForegroundColor Red
     Detail $Ex.GetType().FullName 'Yellow'
     Detail $Ex.Message 'Yellow'
     $inner = $Ex.InnerException
@@ -125,8 +132,15 @@ Detail ("usp_BeginFileStreamInsert : {0}" -f $(if ([int]$d.ProcExists) { 'presen
 if (-not [int]$d.ProcExists -or -not [int]$d.TableExists) {
     Write-Host '  Re-run sql\02-create-database.sql.' -ForegroundColor Red
 }
-if (Test-Path -LiteralPath $d.ContainerPath) { Detail 'Container directory is visible to this client: yes' 'Green' }
-else { Detail 'Container directory is NOT visible from this client path.' 'Yellow' }
+if (Test-Path -LiteralPath $d.ContainerPath -ErrorAction SilentlyContinue) {
+    Detail 'Container directory is readable by this account: yes' 'Green'
+}
+else {
+    # SQL Server ACLs the container to the service account. A client that
+    # cannot read it directly is normal and says nothing about whether
+    # streaming works -- streamed access goes through the filter driver.
+    Detail 'Container directory not directly readable by this account (normal -- SQL Server restricts it).' 'DarkGray'
+}
 }
 catch { Report-NonFatal 'database FILESTREAM configuration' $_.Exception }
 
@@ -179,11 +193,15 @@ try {
         return
     }
 
-    $unc = Split-Path -Parent $fsPath
     if ($null -ne $r) {
         Detail ("Server share root  : \\{0}\{1}" -f $r.MachineName, $r.ShareName)
     }
-    Detail ("Path parent visible: {0}" -f (Test-Path -LiteralPath $unc)) 'DarkGray'
+    # Deliberately NOT probing that UNC path with Test-Path. The FILESTREAM
+    # namespace is virtual: it is served by the RsFx filter driver and can only
+    # be opened with a live transaction context. Browsing it returns "Access is
+    # denied" on a perfectly healthy instance, so the probe proves nothing --
+    # and under $ErrorActionPreference = 'Stop' it aborts this script before it
+    # reaches the streaming test.
 
     # -----------------------------------------------------------------------
     Step "Open SqlFileStream for write and stream $SizeKB KB"
@@ -230,14 +248,15 @@ try {
 }
 catch {
     Explain $_.Exception
-    Write-Host ''
-    Write-Host '  Most likely causes, in order:' -ForegroundColor Yellow
-    Write-Host '    1. FILESTREAM effective level < 2 (the Win32 open is refused).' -ForegroundColor Gray
-    Write-Host '    2. The SQL Server service account lacks Full Control on the container.' -ForegroundColor Gray
-    Write-Host '    3. The calling Windows account cannot reach the FILESTREAM share.' -ForegroundColor Gray
-    Write-Host '    4. Antivirus is holding or blocking files in the container.' -ForegroundColor Gray
-    Write-Host '    5. The client is not on the SQL Server machine and the Windows' -ForegroundColor Gray
-    Write-Host '       access level is 2 rather than 3 (remote streaming disabled).' -ForegroundColor Gray
+    if ($script:currentStep -like 'Open SqlFileStream*') {
+        Write-Host ''
+        Write-Host '  Causes of Access Denied on the streaming open, in order:' -ForegroundColor Yellow
+        Write-Host '    1. The SQL Server service account lacks Full Control on the container.' -ForegroundColor Gray
+        Write-Host '    2. Antivirus is holding or blocking files in the container.' -ForegroundColor Gray
+        Write-Host '    3. The client is not on the SQL Server machine and the Windows' -ForegroundColor Gray
+        Write-Host '       access level is 2 rather than 3 (remote streaming disabled).' -ForegroundColor Gray
+        Write-Host '    4. The transaction was committed or rolled back before the open.' -ForegroundColor Gray
+    }
     throw
 }
 finally {
