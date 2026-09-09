@@ -13,13 +13,20 @@
 param(
     [Parameter(Mandatory)] [guid]   $RunId,
     [Parameter(Mandatory)] [string] $ResultsDir,
-    [string] $ConfigPath = (Join-Path $PSScriptRoot 'FsPocConfig.psd1'),
+    [string] $ConfigPath,
     [int]    $BatchSize  = 10000
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-Import-Module (Join-Path $PSScriptRoot 'FsPoc.Common.psm1') -Force
+
+# Windows PowerShell 5.1 does not reliably populate $PSScriptRoot while it binds
+# parameter defaults, so the script directory is resolved here in the body --
+# where it is always available -- and parameter defaults are applied after.
+# Everything below uses $ScriptDir; nothing uses $PSScriptRoot.
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'FsPocConfig.psd1' }
+Import-Module (Join-Path $ScriptDir 'FsPoc.Common.psm1') -Force
 
 $cfg = Get-FsPocConfig -Path $ConfigPath
 $csvFiles = @(Get-ChildItem -LiteralPath $ResultsDir -Filter 'timings_w*.csv' -File)

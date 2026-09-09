@@ -21,9 +21,15 @@ Add-Type -AssemblyName System.Data -ErrorAction SilentlyContinue
 function Get-FsPocConfig {
     [CmdletBinding()]
     param(
-        [string] $Path = (Join-Path $PSScriptRoot 'FsPocConfig.psd1'),
+        [string] $Path,
         [hashtable] $Override = @{}
     )
+    # Same reason as the scripts: resolve in the body, not in the default.
+    # Inside a module $PSScriptRoot is the module's own directory.
+    if (-not $Path) {
+        $moduleDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Module.Path }
+        $Path = Join-Path $moduleDir 'FsPocConfig.psd1'
+    }
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "Config not found: $Path"
     }

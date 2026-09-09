@@ -12,7 +12,13 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-Import-Module (Join-Path $PSScriptRoot 'FsPoc.Common.psm1') -Force
+
+# Windows PowerShell 5.1 does not reliably populate $PSScriptRoot while it binds
+# parameter defaults, so the script directory is resolved here in the body --
+# where it is always available -- and parameter defaults are applied after.
+# Everything below uses $ScriptDir; nothing uses $PSScriptRoot.
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+Import-Module (Join-Path $ScriptDir 'FsPoc.Common.psm1') -Force
 
 $statePath = Join-Path $ResultsDir 'capture-state.json'
 if (-not (Test-Path -LiteralPath $statePath)) { throw "No capture-state.json in $ResultsDir" }

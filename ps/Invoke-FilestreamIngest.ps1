@@ -39,7 +39,7 @@ param(
 
     [guid]   $RunId = [guid]::NewGuid(),
     [string] $RunName,
-    [string] $ConfigPath = (Join-Path $PSScriptRoot 'FsPocConfig.psd1'),
+    [string] $ConfigPath,
 
     # Ingest real files from a directory tree instead of synthesising them.
     [string] $SourcePath,
@@ -60,7 +60,14 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-Import-Module (Join-Path $PSScriptRoot 'FsPoc.Common.psm1') -Force
+# Windows PowerShell 5.1 does not reliably populate $PSScriptRoot while it binds
+# parameter defaults, so the script directory is resolved here in the body --
+# where it is always available -- and parameter defaults are applied after.
+# Everything below uses $ScriptDir; nothing uses $PSScriptRoot.
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'FsPocConfig.psd1' }
+
+Import-Module (Join-Path $ScriptDir 'FsPoc.Common.psm1') -Force
 
 if ($PSVersionTable.PSVersion.Major -ge 6) {
     throw "This script requires Windows PowerShell 5.1. SqlFileStream does not exist in .NET Core/.NET 5+. Launch with: powershell.exe -File $PSCommandPath"
@@ -585,7 +592,7 @@ if (-not $NoMonitorDb) {
         -Parameters @{ RunId = $RunId; ActualBytes = $bytes; FileCount = $files
                        Notes = "errors=$errors; results=$resultsDir" } | Out-Null
 
-    & (Join-Path $PSScriptRoot 'Import-PocTimings.ps1') -RunId $RunId -ResultsDir $resultsDir -ConfigPath $ConfigPath
+    & (Join-Path $ScriptDir 'Import-PocTimings.ps1') -RunId $RunId -ResultsDir $resultsDir -ConfigPath $ConfigPath
 }
 
 [pscustomobject]@{

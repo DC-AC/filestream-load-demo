@@ -38,7 +38,7 @@ param(
     [ValidateSet('Tiny', 'Small', 'Medium', 'Large', 'Huge', 'Mixed')]
     [string] $SizeProfile,
 
-    [string] $ConfigPath = (Join-Path $PSScriptRoot 'FsPocConfig.psd1'),
+    [string] $ConfigPath,
     [string] $SourcePath,
     [switch] $Preallocate,
 
@@ -58,7 +58,14 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-Import-Module (Join-Path $PSScriptRoot 'FsPoc.Common.psm1') -Force
+
+# Windows PowerShell 5.1 does not reliably populate $PSScriptRoot while it binds
+# parameter defaults, so the script directory is resolved here in the body --
+# where it is always available -- and parameter defaults are applied after.
+# Everything below uses $ScriptDir; nothing uses $PSScriptRoot.
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'FsPocConfig.psd1' }
+Import-Module (Join-Path $ScriptDir 'FsPoc.Common.psm1') -Force
 
 if ($PSVersionTable.PSVersion.Major -ge 6) {
     throw "Run under Windows PowerShell 5.1: powershell.exe -ExecutionPolicy Bypass -File $PSCommandPath"
@@ -67,7 +74,38 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
 $cfg = Get-FsPocConfig -Path $ConfigPath -Override @{
     TargetGB = $TargetGB; Threads = $Threads; ChunkSizeKB = $ChunkSizeKB; SizeProfile = $SizeProfile
 }
-$sqlDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'sql'
+$sqlDir = Join-Path (Split-Path -Parent $ScriptDir) 'sql'
+
+# ---------------------------------------------------------------------------
+# Preflight. Failing here with a clear message beats failing 40 minutes into a
+# run, or -- worse -- producing numbers from a half-configured instance.
+# ---------------------------------------------------------------------------
+try {
+    $pre = Invoke-FsPocSql -Instance $cfg.SqlInstance -Database 'master' -Query @"
+SELECT
+    FsLevel   = CONVERT(int, SERVERPROPERTY('FilestreamEffectiveLevel')),
+    DemoDb    = CASE WHEN DB_ID(N'$($cfg.DemoDb)')    IS NULL THEN 0 ELSE 1 END,
+    MonitorDb = CASE WHEN DB_ID(N'$($cfg.MonitorDb)') IS NULL THEN 0 ELSE 1 END
+"@
+}
+catch {
+    throw "Cannot reach SQL Server instance '$($cfg.SqlInstance)': $($_.Exception.Message)`nCheck SqlInstance in $ConfigPath."
+}
+
+$missing = @()
+if ($pre.Rows[0].FsLevel   -lt 2) { $missing += "FILESTREAM effective level is $($pre.Rows[0].FsLevel); the streaming API needs 2 or higher" }
+if ($pre.Rows[0].DemoDb    -eq 0) { $missing += "database '$($cfg.DemoDb)' does not exist" }
+if ($pre.Rows[0].MonitorDb -eq 0) { $missing += "database '$($cfg.MonitorDb)' does not exist" }
+
+if ($missing.Count -gt 0) {
+    Write-Host ''
+    Write-FsPocLog 'Preflight failed:' 'ERROR'
+    $missing | ForEach-Object { Write-Host "    * $_" -ForegroundColor Red }
+    Write-Host ''
+    throw "Run setup first (elevated):`n" +
+          "    powershell.exe -ExecutionPolicy Bypass -File $ScriptDir\Setup-FilestreamPoc.ps1 -RestartSqlService -ApplyNtfsTuning"
+}
+Write-FsPocLog "Preflight OK: FILESTREAM level $($pre.Rows[0].FsLevel), $($cfg.DemoDb) and $($cfg.MonitorDb) present." 'OK'
 
 # ---------------------------------------------------------------------------
 function Invoke-OneRun {
@@ -98,7 +136,7 @@ function Invoke-OneRun {
         if ($ProcmonWindowSec) { $captureArgs.ProcmonWindowSec = $ProcmonWindowSec }
         if ($ProcmonConfig)    { $captureArgs.ProcmonConfig = $ProcmonConfig }
     }
-    & (Join-Path $PSScriptRoot 'Start-PocCapture.ps1') @captureArgs | Out-Null
+    & (Join-Path $ScriptDir 'Start-PocCapture.ps1') @captureArgs | Out-Null
 
     # ---- DMV activity sampler --------------------------------------------
     # A dedicated runspace rather than a SQL Agent job: it starts and stops
@@ -143,7 +181,7 @@ function Invoke-OneRun {
         }
         if ($SourcePath)  { $ingestArgs.SourcePath = $SourcePath }
         if ($Preallocate) { $ingestArgs.Preallocate = $true }
-        $result = & (Join-Path $PSScriptRoot 'Invoke-FilestreamIngest.ps1') @ingestArgs
+        $result = & (Join-Path $ScriptDir 'Invoke-FilestreamIngest.ps1') @ingestArgs
     }
     finally {
         # ---- Stop sampler -------------------------------------------------
@@ -153,7 +191,7 @@ function Invoke-OneRun {
             $samplerPs.Dispose(); $samplerRs.Close(); $samplerRs.Dispose()
         }
         # ---- Stop monitoring ----------------------------------------------
-        try { & (Join-Path $PSScriptRoot 'Stop-PocCapture.ps1') -ResultsDir $resultsDir }
+        try { & (Join-Path $ScriptDir 'Stop-PocCapture.ps1') -ResultsDir $resultsDir }
         catch { Write-FsPocLog "Stop-PocCapture failed: $($_.Exception.Message)" 'WARN' }
     }
 
@@ -170,7 +208,7 @@ function Invoke-OneRun {
     $pmCsv = Join-Path $resultsDir 'procmon.csv'
     if ($Procmon -and (Test-Path -LiteralPath $pmCsv)) {
         Write-Host ''
-        try { & (Join-Path $PSScriptRoot 'Measure-ProcmonLog.ps1') -CsvPath $pmCsv -ConfigPath $ConfigPath }
+        try { & (Join-Path $ScriptDir 'Measure-ProcmonLog.ps1') -CsvPath $pmCsv -ConfigPath $ConfigPath }
         catch { Write-FsPocLog "Procmon analysis failed: $($_.Exception.Message)" 'WARN' }
     }
 

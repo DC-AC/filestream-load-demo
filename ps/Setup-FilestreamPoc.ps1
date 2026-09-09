@@ -22,7 +22,7 @@
 param(
     [ValidateRange(1, 3)] [int] $AccessLevel = 2,
     [string] $ShareName,
-    [string] $ConfigPath = (Join-Path $PSScriptRoot 'FsPocConfig.psd1'),
+    [string] $ConfigPath,
     [switch] $RestartSqlService,
     [switch] $SkipDatabase,
     [switch] $ApplyNtfsTuning
@@ -30,7 +30,14 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-Import-Module (Join-Path $PSScriptRoot 'FsPoc.Common.psm1') -Force
+
+# Windows PowerShell 5.1 does not reliably populate $PSScriptRoot while it binds
+# parameter defaults, so the script directory is resolved here in the body --
+# where it is always available -- and parameter defaults are applied after.
+# Everything below uses $ScriptDir; nothing uses $PSScriptRoot.
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'FsPocConfig.psd1' }
+Import-Module (Join-Path $ScriptDir 'FsPoc.Common.psm1') -Force
 
 if (-not (Test-FsPocElevated)) { throw 'Run this elevated. FILESTREAM enablement and fsutil both require admin.' }
 
@@ -193,7 +200,7 @@ Write-Host @"
 if ($SkipDatabase) { Write-FsPocLog 'Skipping database creation (-SkipDatabase).' 'INFO'; return }
 
 Write-FsPocLog 'Step 4: instance configuration and databases' 'STEP'
-$sqlDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'sql'
+$sqlDir = Join-Path (Split-Path -Parent $ScriptDir) 'sql'
 $vars = @{
     DbName          = $cfg.DemoDb
     MonitorDb       = $cfg.MonitorDb
@@ -220,7 +227,7 @@ foreach ($script in '01-instance-config.sql', '02-create-database.sql', '03-moni
 # ---------------------------------------------------------------------------
 Write-FsPocLog 'Step 5: SqlFileStream smoke test' 'STEP'
 try {
-    $r = & (Join-Path $PSScriptRoot 'Invoke-FilestreamIngest.ps1') `
+    $r = & (Join-Path $ScriptDir 'Invoke-FilestreamIngest.ps1') `
             -Scenario Filestream -TargetGB 0.05 -Threads 2 -SizeProfile Medium `
             -ConfigPath $ConfigPath -NoMonitorDb
     if ($r.Errors -gt 0) { Write-FsPocLog "Smoke test completed with $($r.Errors) errors." 'WARN' }

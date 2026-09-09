@@ -28,7 +28,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)] [string] $CsvPath,
-    [string] $ConfigPath = (Join-Path $PSScriptRoot 'FsPocConfig.psd1'),
+    [string] $ConfigPath,
     [string] $ContainerPath,
     [string] $ProcessFilter = 'sqlservr.exe',
     [int]    $SampleFileCount = 3,
@@ -37,7 +37,14 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-Import-Module (Join-Path $PSScriptRoot 'FsPoc.Common.psm1') -Force
+
+# Windows PowerShell 5.1 does not reliably populate $PSScriptRoot while it binds
+# parameter defaults, so the script directory is resolved here in the body --
+# where it is always available -- and parameter defaults are applied after.
+# Everything below uses $ScriptDir; nothing uses $PSScriptRoot.
+$ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
+if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'FsPocConfig.psd1' }
+Import-Module (Join-Path $ScriptDir 'FsPoc.Common.psm1') -Force
 Add-Type -AssemblyName Microsoft.VisualBasic
 
 $cfg = Get-FsPocConfig -Path $ConfigPath
