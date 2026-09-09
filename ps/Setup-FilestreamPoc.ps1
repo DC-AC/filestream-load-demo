@@ -25,7 +25,8 @@ param(
     [string] $ConfigPath,
     [switch] $RestartSqlService,
     [switch] $SkipDatabase,
-    [switch] $ApplyNtfsTuning
+    [switch] $ApplyNtfsTuning,
+    [switch] $IgnoreVolumeLabels
 )
 
 Set-StrictMode -Version Latest
@@ -131,6 +132,57 @@ foreach ($v in $volInfo) {
         $v.DriveLetter, $v.Label, $v.BlockSize, ($v.FreeSpace / 1GB), $v.FileSystem)
 }
 Write-Host ''
+
+<#  Cross-check each volume's LABEL against the role the config assigns it.
+
+    This exists because the defaults once had the container on the volume
+    labelled SQLVMLOG and the log on the volume labelled Filestream. Setup
+    created the directories, the databases built cleanly, and nothing
+    complained -- but every number the POC produced would have been measuring
+    the wrong disk. Labels are the only intent the machine records, so they are
+    worth believing when they disagree with the config.
+#>
+$roleChecks = @(
+    [pscustomobject]@{ Role = 'FILESTREAM container'; Path = $cfg.FsPath;   Expect = 'filestream'; Conflicts = @('log', 'data') }
+    [pscustomobject]@{ Role = 'Transaction log';      Path = $cfg.LogPath;  Expect = 'log';        Conflicts = @('filestream') }
+    [pscustomobject]@{ Role = 'Data files';           Path = $cfg.DataPath; Expect = 'data';       Conflicts = @('log', 'filestream') }
+    [pscustomobject]@{ Role = 'Extended Events';      Path = $cfg.XePath;   Expect = '';           Conflicts = @('filestream', 'log') }
+)
+
+$mismatch = $false
+foreach ($check in $roleChecks) {
+    if ([string]::IsNullOrWhiteSpace($check.Path)) { continue }
+    $drive = Split-Path -Qualifier $check.Path
+    $vol   = $volInfo | Where-Object DriveLetter -eq $drive | Select-Object -First 1
+    if (-not $vol -or [string]::IsNullOrWhiteSpace($vol.Label)) { continue }
+    $label = $vol.Label.ToLowerInvariant()
+
+    $hit = @($check.Conflicts | Where-Object { $label -like "*$_*" })
+    if ($hit.Count -gt 0 -and ($check.Expect -eq '' -or $label -notlike "*$($check.Expect)*")) {
+        $mismatch = $true
+        Write-FsPocLog ("$($check.Role) is configured on $drive, but that volume is labelled '$($vol.Label)'.") 'ERROR'
+    }
+}
+
+# Two heavy roles sharing one spindle is the other way to measure the wrong thing.
+$fsDriveLetter  = Split-Path -Qualifier $cfg.FsPath
+$logDriveLetter = Split-Path -Qualifier $cfg.LogPath
+if ($fsDriveLetter -eq $logDriveLetter) {
+    $mismatch = $true
+    Write-FsPocLog "The FILESTREAM container and the transaction log are both on $fsDriveLetter. They will compete for the same IOPS budget and the result will describe the disk, not FILESTREAM." 'ERROR'
+}
+
+if ($mismatch) {
+    Write-Host ''
+    Write-Host '  Volume assignment looks wrong. Fix the paths in ps\FsPocConfig.psd1' -ForegroundColor Red
+    Write-Host '  and re-run, or pass -IgnoreVolumeLabels if the labels are misleading.' -ForegroundColor Red
+    Write-Host ''
+    if (-not $IgnoreVolumeLabels) {
+        throw 'Aborting: configured volume roles disagree with the volume labels. Nothing has been created.'
+    }
+    Write-FsPocLog 'Continuing anyway (-IgnoreVolumeLabels).' 'WARN'
+}
+else { Write-FsPocLog 'Volume roles are consistent with the volume labels.' 'OK' }
 
 foreach ($v in $volInfo) {
     if ($v.FileSystem -ne 'NTFS') {

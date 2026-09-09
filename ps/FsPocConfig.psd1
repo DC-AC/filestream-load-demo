@@ -9,11 +9,15 @@
     # anything. The FILESTREAM container and the transaction log competing for
     # one disk's IOPS budget is the single most common way to get a misleading
     # FILESTREAM POC result.
-    DataPath      = 'F:\SQLData'              # MDF
-    LogPath       = 'H:\SQLLog'               # LDF
-    FsPath        = 'G:\FilestreamData'       # FILESTREAM container (parent must exist)
+    # VERIFY THESE AGAINST THE ACTUAL VOLUMES BEFORE THE FIRST RUN.
+    # Setup-FilestreamPoc.ps1 prints each volume's label and cross-checks it
+    # against the role assigned here, because putting the container on the log
+    # disk produces numbers that measure the wrong thing entirely.
+    DataPath      = 'F:\SQLData'              # MDF          -> data volume
+    LogPath       = 'G:\SQLLog'               # LDF          -> log volume
+    FsPath        = 'H:\FilestreamData'       # FILESTREAM container (parent must exist)
     FsPath2       = ''                        # optional 2nd container on another disk
-    XePath        = 'H:\XEvents'              # Extended Events .xel target
+    XePath        = 'F:\XEvents'              # .xel target -- keep OFF the container and log volumes
     ResultsPath   = 'C:\FsPocResults'         # CSVs, Procmon logs, reports
 
     # --- Tools ------------------------------------------------------------

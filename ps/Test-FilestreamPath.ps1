@@ -78,8 +78,19 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
     Write-Host '  SqlFileStream does not exist in .NET Core/.NET 5+. Re-run with powershell.exe.' -ForegroundColor Red
     return
 }
-try { $null = [System.Data.SqlTypes.SqlFileStream]; Detail 'SqlFileStream type resolves: yes' 'Green' }
-catch { Write-Host '  SqlFileStream type could not be resolved.' -ForegroundColor Red; Explain $_.Exception; return }
+try {
+    $sfsType = [System.Data.SqlTypes.SqlFileStream]
+    Detail 'SqlFileStream type resolves: yes' 'Green'
+    Detail ("assembly: {0}" -f $sfsType.Assembly.GetName().Name) 'DarkGray'
+    # Print the actual constructor signatures rather than assume them.
+    foreach ($ctor in $sfsType.GetConstructors()) {
+        $sig = ($ctor.GetParameters() | ForEach-Object { "$($_.ParameterType.Name) $($_.Name)" }) -join ', '
+        Detail ("ctor: SqlFileStream($sig)") 'DarkGray'
+    }
+    $null = [System.IO.FileOptions]::SequentialScan
+    Detail 'System.IO.FileOptions resolves: yes' 'Green'
+}
+catch { Write-Host '  SqlFileStream could not be resolved.' -ForegroundColor Red; Explain $_.Exception; return }
 
 # ---------------------------------------------------------------------------
 Step 'Instance FILESTREAM configuration'
@@ -211,7 +222,7 @@ try {
     $sfs = New-Object System.Data.SqlTypes.SqlFileStream(
                 $fsPath, $fsCtx,
                 [System.IO.FileAccess]::Write,
-                [System.Data.SqlTypes.SqlFileStreamOptions]::SequentialScan,
+                [System.IO.FileOptions]::SequentialScan,
                 [long]0)
     try {
         Detail ("Handle opened. Name: {0}" -f $sfs.Name) 'Green'
@@ -248,7 +259,9 @@ try {
 }
 catch {
     Explain $_.Exception
-    if ($script:currentStep -like 'Open SqlFileStream*') {
+    if ($script:currentStep -like 'Open SqlFileStream*' -and
+        ($_.Exception -is [System.UnauthorizedAccessException] -or
+         $_.Exception -is [System.ComponentModel.Win32Exception])) {
         Write-Host ''
         Write-Host '  Causes of Access Denied on the streaming open, in order:' -ForegroundColor Yellow
         Write-Host '    1. The SQL Server service account lacks Full Control on the container.' -ForegroundColor Gray

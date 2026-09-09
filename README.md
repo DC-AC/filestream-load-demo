@@ -50,6 +50,8 @@ ps/
   FsPocConfig.psd1           <- edit this first
   FsPoc.Common.psm1          Shared helpers, workload planner, random pool
   Setup-FilestreamPoc.ps1    One-time VM prep + smoke test
+  Reset-FilestreamPoc.ps1    Full teardown before a rebuild (dry run by default)
+  Test-FilestreamPath.ps1    Single-file step-by-step SqlFileStream diagnostic
   Invoke-PocRun.ps1          <- entry point
   Invoke-FilestreamIngest.ps1  The ingest/read engine
   Start-PocCapture.ps1       XEvents + Perfmon + windowed Procmon
@@ -73,7 +75,14 @@ procmon/README.md            Procmon column/filter setup (one-time, manual)
    **Put `FsPath`, `LogPath` and `ResultsPath` on separate disks** — see the
    Azure notes below.
 
-3. One-time setup, elevated:
+3. **Check the volume roles.** `DataPath`, `LogPath` and `FsPath` must point at
+   the volumes you actually intend. Putting the FILESTREAM container on the log
+   disk produces a result that measures the wrong device, and nothing downstream
+   will complain. Setup cross-checks each path's drive against that volume's
+   label and refuses to continue on a mismatch (`-IgnoreVolumeLabels` overrides
+   it when the labels are the thing that's wrong).
+
+4. One-time setup, elevated:
 
    ```powershell
    powershell.exe -ExecutionPolicy Bypass -File .\ps\Setup-FilestreamPoc.ps1 -RestartSqlService -ApplyNtfsTuning
@@ -84,10 +93,10 @@ procmon/README.md            Procmon column/filter setup (one-time, manual)
    a 50 MB smoke test through the real `SqlFileStream` path. If the smoke test
    fails, nothing else in the kit will work — it prints the four usual causes.
 
-4. Set up Procmon once, following [`procmon/README.md`](procmon/README.md).
+5. Set up Procmon once, following [`procmon/README.md`](procmon/README.md).
    The Duration column is off by default and you need it.
 
-5. Run:
+6. Run:
 
    ```powershell
    # The headline number: 200 GB, clean, no tracing overhead
@@ -283,6 +292,21 @@ It runs under PowerShell 7 on any OS. It does **not** cover the `SqlFileStream`
 path, WMI FILESTREAM enablement, or anything else needing Windows and SQL
 Server — `Setup-FilestreamPoc.ps1` ends with a real 50 MB smoke test through
 `SqlFileStream` on the VM, and that is the check that actually matters.
+
+## Changing any path after the first build
+
+Correcting a path in the config is not enough on its own. Run:
+
+```powershell
+.\ps\Reset-FilestreamPoc.ps1            # shows what it would remove
+.\ps\Reset-FilestreamPoc.ps1 -Execute   # drops both DBs, removes containers
+```
+
+The FILESTREAM container's leaf folder must not exist when `CREATE DATABASE`
+runs, and a container left over from a previous build is the usual reason the
+next `CREATE` fails. Reset reads the real file locations from
+`sys.master_files` rather than trusting the config, which matters precisely
+when the config is what you just changed.
 
 ## Known gotchas
 

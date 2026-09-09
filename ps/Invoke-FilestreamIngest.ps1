@@ -311,7 +311,7 @@ $worker = {
                         $sfs = New-Object System.Data.SqlTypes.SqlFileStream(
                                     $fsPath, $fsCtx,
                                     [System.IO.FileAccess]::Write,
-                                    [System.Data.SqlTypes.SqlFileStreamOptions]::SequentialScan,
+                                    [System.IO.FileOptions]::SequentialScan,
                                     $alloc)
                         try {
                             $stage = 'SqlFileStream write'
@@ -419,7 +419,7 @@ $worker = {
                         $sfs = New-Object System.Data.SqlTypes.SqlFileStream(
                                     $fsPath, $fsCtx,
                                     [System.IO.FileAccess]::Read,
-                                    [System.Data.SqlTypes.SqlFileStreamOptions]::SequentialScan,
+                                    [System.IO.FileOptions]::SequentialScan,
                                     [long]0)
                         try {
                             while (($n = $sfs.Read($chunkBuf, 0, $chunkBuf.Length)) -gt 0) { $read += $n }
