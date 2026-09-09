@@ -106,6 +106,7 @@ function Invoke-FsPocSql {
         [Parameter(Mandatory, ParameterSetName = 'File')]  [string] $InputFile,
         [hashtable] $Parameters = @{},
         [hashtable] $SqlcmdVariables = @{},
+        [string[]] $ExtraArgs = @(),
         [int] $CommandTimeout = 0,
         [switch] $NonQuery
     )
@@ -113,11 +114,42 @@ function Invoke-FsPocSql {
     if ($PSCmdlet.ParameterSetName -eq 'File') {
         # sqlcmd.exe handles :setvar / GO batching, which System.Data cannot.
         if (-not (Test-Path -LiteralPath $InputFile)) { throw "SQL file not found: $InputFile" }
-        $args = @('-S', $Instance, '-E', '-b', '-I', '-i', $InputFile)
-        foreach ($k in $SqlcmdVariables.Keys) { $args += @('-v', "$k=$($SqlcmdVariables[$k])") }
-        Write-FsPocLog "sqlcmd -i $(Split-Path -Leaf $InputFile)" 'INFO'
-        & sqlcmd.exe @args
-        if ($LASTEXITCODE -ne 0) { throw "sqlcmd failed (exit $LASTEXITCODE) on $InputFile" }
+
+        <#  Scripting variables go through the PROCESS ENVIRONMENT, not -v.
+
+            Windows PowerShell's native-argument quoting mangles -v values that
+            contain a colon and a backslash: 'DataPath=F:\SQLData' arrives at
+            sqlcmd as ':\SQLData' and it exits 1 with "Invalid argument".
+            Quoting the value does not help -- it just moves the problem into
+            PowerShell's quote-escaping rules. And -v cannot express an empty
+            value at all.
+
+            sqlcmd resolves an undefined scripting variable from the environment,
+            so this path is documented, has no quoting rules whatsoever, and is
+            the same mechanism sql\00-set-variables.cmd uses for manual runs.
+        #>
+        $savedEnv = @{}
+        try {
+            foreach ($k in $SqlcmdVariables.Keys) {
+                $savedEnv[$k] = [Environment]::GetEnvironmentVariable($k, 'Process')
+                $v = [string]$SqlcmdVariables[$k]
+                # Windows DELETES an environment variable set to empty string,
+                # which would leave $(Var) undefined and abort the script on the
+                # first reference. Optional values use a sentinel the SQL knows.
+                if ([string]::IsNullOrEmpty($v)) { $v = 'NONE' }
+                [Environment]::SetEnvironmentVariable($k, $v, 'Process')
+            }
+
+            $sqlcmdArgs = @('-S', $Instance, '-E', '-b', '-I', '-i', $InputFile) + $ExtraArgs
+            Write-FsPocLog "sqlcmd -i $(Split-Path -Leaf $InputFile)" 'INFO'
+            & sqlcmd.exe @sqlcmdArgs
+            if ($LASTEXITCODE -ne 0) { throw "sqlcmd failed (exit $LASTEXITCODE) on $InputFile" }
+        }
+        finally {
+            foreach ($k in $savedEnv.Keys) {
+                [Environment]::SetEnvironmentVariable($k, $savedEnv[$k], 'Process')
+            }
+        }
         return
     }
 

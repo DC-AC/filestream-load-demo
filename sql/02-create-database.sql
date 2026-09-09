@@ -94,8 +94,11 @@ GO
    A FILESTREAM filegroup accepts multiple containers and fills them
    proportionally -- this is how you spread FILESTREAM across data disks to get
    past a single Azure disk's IOPS/throughput cap. */
+-- 'NONE' is the sentinel for "no second container". It exists because an
+-- environment variable set to an empty string is deleted by Windows, which
+-- would leave $(FsPath2) undefined and abort the script on first reference.
 DECLARE @fs2 sysname = N'$(FsPath2)';
-IF LEN(LTRIM(@fs2)) > 0
+IF @fs2 NOT IN (N'', N'NONE') AND LEN(LTRIM(@fs2)) > 0
 BEGIN
     DECLARE @sql nvarchar(max) = N'
         ALTER DATABASE [$(DbName)]
@@ -105,7 +108,7 @@ BEGIN
     PRINT 'Added second FILESTREAM container: ' + @fs2;
 END
 ELSE
-    PRINT 'Single FILESTREAM container. Set -v FsPath2="I:\FilestreamData2" to add a second.';
+    PRINT 'Single FILESTREAM container. Set FsPath2 in ps\FsPocConfig.psd1 to add a second.';
 GO
 
 USE [$(DbName)];

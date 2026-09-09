@@ -153,6 +153,53 @@ Assert-Ok 'Random pool is the right size and actually random' {
 
 # ---------------------------------------------------------------------------
 Write-Host ''
+Write-Host '=== 4. SQLCMD VARIABLES ===' -ForegroundColor Cyan
+# Every $(Var) a .sql file references must be supplied by something, or sqlcmd
+# aborts with "scripting variable not defined" partway through the batch. The
+# supplied set is the union of every hashtable literal in the PowerShell (which
+# is where -SqlcmdVariables values come from) and sql\00-set-variables.cmd.
+$repoRoot = Split-Path -Parent $PSScriptRoot
+$sqlRoot  = Join-Path $repoRoot 'sql'
+
+$supplied = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($file in Get-ChildItem $PsRoot -Include *.ps1, *.psm1 -Recurse) {
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+    foreach ($ht in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.HashtableAst] }, $true)) {
+        foreach ($pair in $ht.KeyValuePairs) { $null = $supplied.Add($pair.Item1.Extent.Text.Trim("'", '"')) }
+    }
+}
+$cmdFile = Join-Path $sqlRoot '00-set-variables.cmd'
+if (Test-Path $cmdFile) {
+    foreach ($line in Get-Content $cmdFile) {
+        if ($line -match '^\s*set\s+([A-Za-z_]\w*)\s*=') { $null = $supplied.Add($Matches[1]) }
+    }
+}
+
+foreach ($sql in Get-ChildItem $sqlRoot -Filter *.sql | Sort-Object Name) {
+    $refs = [regex]::Matches((Get-Content $sql.FullName -Raw), '\$\(([A-Za-z_]\w*)\)') |
+            ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique
+    $unmet = @($refs | Where-Object { -not $supplied.Contains($_) })
+    if ($unmet.Count) {
+        $script:Failures++
+        Write-Host ("  FAIL  {0} references {1} but nothing supplies {2}" -f `
+            $sql.Name, ($unmet -join ', '), $(if ($unmet.Count -eq 1) { 'it' } else { 'them' })) -ForegroundColor Red
+    }
+    elseif ($refs.Count) { Write-Host ("  PASS  {0} ({1} variable(s))" -f $sql.Name, $refs.Count) -ForegroundColor Green }
+    else { Write-Host ("  PASS  {0} (no variables)" -f $sql.Name) -ForegroundColor Green }
+}
+
+# The empty-string sentinel contract: an environment variable set to '' is
+# deleted by Windows, so optional values are passed as 'NONE' and the SQL must
+# recognise it. Guard both ends.
+Assert-Ok 'Optional SQL variables handle the NONE sentinel' {
+    $create = Get-Content (Join-Path $sqlRoot '02-create-database.sql') -Raw
+    if ($create -notmatch "N'NONE'") { throw "02-create-database.sql does not handle FsPath2 = 'NONE'" }
+    $analysis = Get-Content (Join-Path $sqlRoot '05-analysis.sql') -Raw
+    if ($analysis -notmatch "N'NONE'") { throw "05-analysis.sql does not handle RunId = 'NONE'" }
+}
+
+# ---------------------------------------------------------------------------
+Write-Host ''
 if ($script:Failures -eq 0) {
     Write-Host 'ALL CHECKS PASS' -ForegroundColor Green
     Write-Host 'Note: the SqlFileStream path is not covered here. Setup-FilestreamPoc.ps1' -ForegroundColor DarkGray

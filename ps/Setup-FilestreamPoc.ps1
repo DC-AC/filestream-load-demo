@@ -211,7 +211,6 @@ $vars = @{
     MonitorDataPath = $cfg.DataPath
     MonitorLogPath  = $cfg.LogPath
     XePath          = $cfg.XePath
-    TargetDb        = $cfg.DemoDb
     TargetGB        = $cfg.TargetGB
     DirectoryName   = $cfg.DemoDb
     SessionName     = 'FsPoc_Waits'

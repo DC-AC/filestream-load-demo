@@ -23,8 +23,13 @@ USE FsPocMonitor;
 SET NOCOUNT ON;
 GO
 
+-- '', 'NONE' and 'LATEST' all mean "report on the most recent run". NONE is
+-- the sentinel used when the value is supplied through the environment, where
+-- an empty string cannot survive.
+DECLARE @RunIdText nvarchar(50) = N'$(RunId)';
 DECLARE @RunId uniqueidentifier =
-    NULLIF(N'$(RunId)', N'');
+    CASE WHEN @RunIdText IN (N'', N'NONE', N'LATEST') THEN NULL
+         ELSE TRY_CONVERT(uniqueidentifier, @RunIdText) END;
 
 IF @RunId IS NULL
     SELECT TOP (1) @RunId = RunId FROM dbo.PocRun ORDER BY StartedAtUtc DESC;

@@ -15,13 +15,19 @@
 
       sqlcmd -S . -E -b -i sql\04-xevents.sql
 
+    SCOPE: this session is INSTANCE-WIDE, filtered only by duration and
+    is_system = 0. It is not scoped to one database on purpose -- the predicate
+    sources available on sqlos.wait_info vary across versions and a database
+    filter that silently matches nothing is worse than no filter. On a dedicated
+    POC VM there is nothing else running to dilute it; on a shared instance,
+    correlate by session_id when you shred.
+
     Start/stop is handled by ps\Start-PocCapture.ps1 / Stop-PocCapture.ps1.
 */
 
 /*  SQLCMD SCRIPTING VARIABLES REQUIRED BY THIS SCRIPT
       XePath           default: H:\XEvents
       SessionName      default: FsPoc_Waits
-      TargetDb         default: FsPocDemo
       MinWaitMs        default: 10
     These are intentionally NOT declared with :setvar. A :setvar inside a script
     runs AFTER sqlcmd applies -v, so it silently overrides anything passed on

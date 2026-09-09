@@ -13,6 +13,11 @@ REM      sql\00-set-variables.cmd
 REM      sqlcmd -S . -E -b -i sql\02-create-database.sql
 REM
 REM  Edit these to match ps\FsPocConfig.psd1 -- they are not read from it.
+REM
+REM  FsPath2=NONE means "no second FILESTREAM container" and RunId=LATEST means
+REM  "the most recent run". They are sentinels rather than empty strings because
+REM  Windows deletes an environment variable that is set to an empty value,
+REM  which would leave the scripting variable undefined and abort the script.
 
 set DbName=FsPocDemo
 set MonitorDb=FsPocMonitor
@@ -22,7 +27,7 @@ set DirectoryName=FsPocDemo
 set DataPath=F:\SQLData
 set LogPath=H:\SQLLog
 set FsPath=G:\FilestreamData
-set FsPath2=
+set FsPath2=NONE
 set XePath=H:\XEvents
 
 set MonitorDataPath=%DataPath%
@@ -32,7 +37,7 @@ set SessionName=FsPoc_Waits
 set MinWaitMs=10
 set TargetGB=200
 set TopWaits=25
-set RunId=
+set RunId=LATEST
 set Mode=drop
 
 echo FILESTREAM POC sqlcmd variables set for this shell:

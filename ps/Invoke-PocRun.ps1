@@ -254,8 +254,10 @@ if (-not $SkipAnalysis) {
     Write-Host '================================================================' -ForegroundColor Cyan
     foreach ($r in $runs) {
         $out = Join-Path $r.ResultsDir 'analysis.txt'
-        & sqlcmd.exe -S $cfg.SqlInstance -E -b -I -i (Join-Path $sqlDir '05-analysis.sql') `
-                     -v RunId="$($r.RunId)" TopWaits=25 -y 0 -Y 40 -W -s '|' |
+        Invoke-FsPocSql -Instance $cfg.SqlInstance `
+            -InputFile (Join-Path $sqlDir '05-analysis.sql') `
+            -SqlcmdVariables @{ RunId = $r.RunId; TopWaits = 25 } `
+            -ExtraArgs @('-y', '0', '-Y', '40', '-W', '-s', '|') |
             Tee-Object -FilePath $out
         Write-FsPocLog "Analysis saved to $out" 'OK'
     }
@@ -266,8 +268,11 @@ if (-not $SkipAnalysis) {
     if (Test-Path -LiteralPath $xelDir) {
         $xeOut = Join-Path $lastRun.ResultsDir 'xevents-analysis.txt'
         try {
-            & sqlcmd.exe -S $cfg.SqlInstance -E -b -I -i (Join-Path $sqlDir '06-xevent-shred.sql') `
-                         -v XePath="$xelDir" SessionName="FsPoc_Waits" -y 0 -Y 40 -W -s '|' | Tee-Object -FilePath $xeOut
+            Invoke-FsPocSql -Instance $cfg.SqlInstance `
+                -InputFile (Join-Path $sqlDir '06-xevent-shred.sql') `
+                -SqlcmdVariables @{ XePath = $xelDir; SessionName = 'FsPoc_Waits' } `
+                -ExtraArgs @('-y', '0', '-Y', '40', '-W', '-s', '|') |
+                Tee-Object -FilePath $xeOut
             Write-FsPocLog "XEvent analysis saved to $xeOut" 'OK'
         }
         catch { Write-FsPocLog "XEvent shred failed: $($_.Exception.Message)" 'WARN' }
