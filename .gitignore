@@ -1,0 +1,23 @@
+# Run output. ResultsPath defaults outside the repo, but guard against a
+# config pointing it here -- a single Procmon backing file is multi-GB.
+results/
+run_*/
+*.pml
+*.csv
+*.xel
+*.blg
+capture-state.json
+analysis.txt
+xevents-analysis.txt
+perfmon-counters.txt
+
+# Procmon configuration is machine-specific and binary
+*.pmc
+
+# Local config overrides (keep FsPocConfig.psd1 as the committed template)
+FsPocConfig.local.psd1
+
+# OS noise
+.DS_Store
+Thumbs.db
+desktop.ini
