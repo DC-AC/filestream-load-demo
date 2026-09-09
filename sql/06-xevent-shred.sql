@@ -50,7 +50,11 @@ SELECT
     FileId     = ed.value('(/event/data[@name="file_id"]/value)[1]', 'int'),
     IoOffset   = ed.value('(/event/data[@name="offset"]/value)[1]', 'bigint'),
     IoPath     = ed.value('(/event/data[@name="path"]/value)[1]', 'nvarchar(400)'),
-    WriteSize  = ed.value('(/event/data[@name="write_size"]/value)[1]', 'bigint'),
+    -- Size field naming varies by event; XQuery yields NULL for an absent node,
+    -- so coalescing candidates is free and cannot error. NULL here just means
+    -- the event does not report a byte count.
+    IoBytes    = COALESCE(ed.value('(/event/data[@name="size"]/value)[1]', 'bigint'),
+                          ed.value('(/event/data[@name="write_size"]/value)[1]', 'bigint')),
     ErrorNum   = ed.value('(/event/data[@name="error_number"]/value)[1]', 'int'),
     ErrorMsg   = ed.value('(/event/data[@name="message"]/value)[1]', 'nvarchar(2000)')
 INTO #ev
@@ -58,6 +62,20 @@ FROM #xe;
 
 CREATE CLUSTERED INDEX CX_ev ON #ev (EventTime);
 GO
+
+PRINT '';
+PRINT '--- What is actually in the trace ---------------------------------';
+PRINT '    The session is assembled from the events available on this build';
+PRINT '    (see 04-xevents.sql), so this list is the ground truth for what';
+PRINT '    the sections below can report on.';
+SELECT
+    EventName,
+    Events    = COUNT(*),
+    FirstSeen = MIN(EventTime),
+    LastSeen  = MAX(EventTime)
+FROM #ev
+GROUP BY EventName
+ORDER BY COUNT(*) DESC;
 
 PRINT '';
 PRINT '--- Wait events by type -------------------------------------------';
@@ -97,9 +115,9 @@ SELECT
     Events   = COUNT(*),
     AvgUs    = CONVERT(decimal(18,1), AVG(RawDuration * 1.0)),
     MaxUs    = MAX(RawDuration),
-    TotalMB  = CONVERT(decimal(18,1), SUM(ISNULL(WriteSize, 0)) / 1048576.0)
+    TotalMB  = CONVERT(decimal(18,1), SUM(ISNULL(IoBytes, 0)) / 1048576.0)
 FROM #ev
-WHERE EventName IN ('file_write_completed','file_read_completed','databases_log_flush')
+WHERE EventName IN ('file_write_completed','file_read_completed')
 GROUP BY EventName, DatabaseId, FileId
 ORDER BY EventName, Events DESC;
 
