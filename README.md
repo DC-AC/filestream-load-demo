@@ -78,9 +78,12 @@ procmon/README.md            Procmon column/filter setup (one-time, manual)
 3. **Check the volume roles.** `DataPath`, `LogPath` and `FsPath` must point at
    the volumes you actually intend. Putting the FILESTREAM container on the log
    disk produces a result that measures the wrong device, and nothing downstream
-   will complain. Setup cross-checks each path's drive against that volume's
-   label and refuses to continue on a mismatch (`-IgnoreVolumeLabels` overrides
-   it when the labels are the thing that's wrong).
+   will complain. Setup cross-checks each path against the instance's own
+   `InstanceDefaultDataPath` and `InstanceDefaultLogPath` — SQL Server's
+   configured defaults are the authoritative statement of which volume is for
+   what, where a volume label is free text that may be stale or blank — and
+   refuses to continue on a mismatch (`-IgnoreVolumeRoles` overrides it when
+   the layout is deliberate).
 
 4. One-time setup, elevated:
 

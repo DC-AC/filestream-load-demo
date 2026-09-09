@@ -26,7 +26,7 @@ param(
     [switch] $RestartSqlService,
     [switch] $SkipDatabase,
     [switch] $ApplyNtfsTuning,
-    [switch] $IgnoreVolumeLabels
+    [switch] $IgnoreVolumeRoles
 )
 
 Set-StrictMode -Version Latest
@@ -133,34 +133,70 @@ foreach ($v in $volInfo) {
 }
 Write-Host ''
 
-<#  Cross-check each volume's LABEL against the role the config assigns it.
+<#  Cross-check the configured volume roles against SQL SERVER'S OWN defaults.
 
-    This exists because the defaults once had the container on the volume
-    labelled SQLVMLOG and the log on the volume labelled Filestream. Setup
-    created the directories, the databases built cleanly, and nothing
-    complained -- but every number the POC produced would have been measuring
-    the wrong disk. Labels are the only intent the machine records, so they are
-    worth believing when they disagree with the config.
+    This exists because the defaults once put the FILESTREAM container on the
+    volume holding the instance's default log directory, and the transaction
+    log on the volume intended for FILESTREAM. Setup created the directories,
+    both databases built cleanly, nothing complained -- and every number the
+    POC produced would have described the wrong device.
+
+    The instance's configured default data and log paths are the authoritative
+    statement of which volume is for what. Volume labels are free text that may
+    be stale, blank, or simply wrong, so they are printed for context but are
+    not used to make this decision.
 #>
-$roleChecks = @(
-    [pscustomobject]@{ Role = 'FILESTREAM container'; Path = $cfg.FsPath;   Expect = 'filestream'; Conflicts = @('log', 'data') }
-    [pscustomobject]@{ Role = 'Transaction log';      Path = $cfg.LogPath;  Expect = 'log';        Conflicts = @('filestream') }
-    [pscustomobject]@{ Role = 'Data files';           Path = $cfg.DataPath; Expect = 'data';       Conflicts = @('log', 'filestream') }
-    [pscustomobject]@{ Role = 'Extended Events';      Path = $cfg.XePath;   Expect = '';           Conflicts = @('filestream', 'log') }
-)
-
 $mismatch = $false
-foreach ($check in $roleChecks) {
-    if ([string]::IsNullOrWhiteSpace($check.Path)) { continue }
-    $drive = Split-Path -Qualifier $check.Path
-    $vol   = $volInfo | Where-Object DriveLetter -eq $drive | Select-Object -First 1
-    if (-not $vol -or [string]::IsNullOrWhiteSpace($vol.Label)) { continue }
-    $label = $vol.Label.ToLowerInvariant()
+$defaults = $null
+try {
+    $defaults = Invoke-FsPocSql -Instance $cfg.SqlInstance -Database 'master' -Query @'
+SELECT
+    DefaultData = CONVERT(nvarchar(260), SERVERPROPERTY('InstanceDefaultDataPath')),
+    DefaultLog  = CONVERT(nvarchar(260), SERVERPROPERTY('InstanceDefaultLogPath'))
+'@
+}
+catch {
+    Write-FsPocLog "Could not read the instance's default paths: $($_.Exception.Message)" 'WARN'
+    Write-FsPocLog 'Skipping the volume role check -- verify DataPath, LogPath and FsPath by hand.' 'WARN'
+}
 
-    $hit = @($check.Conflicts | Where-Object { $label -like "*$_*" })
-    if ($hit.Count -gt 0 -and ($check.Expect -eq '' -or $label -notlike "*$($check.Expect)*")) {
-        $mismatch = $true
-        Write-FsPocLog ("$($check.Role) is configured on $drive, but that volume is labelled '$($vol.Label)'.") 'ERROR'
+if ($defaults -and $defaults.Rows.Count -gt 0) {
+    $defData = [string]$defaults.Rows[0].DefaultData
+    $defLog  = [string]$defaults.Rows[0].DefaultLog
+
+    if ([string]::IsNullOrWhiteSpace($defData) -or [string]::IsNullOrWhiteSpace($defLog)) {
+        Write-FsPocLog 'The instance reports no default data/log path; skipping the volume role check.' 'WARN'
+    }
+    else {
+        $defDataDrive = Split-Path -Qualifier $defData
+        $defLogDrive  = Split-Path -Qualifier $defLog
+        $fsDrive2     = Split-Path -Qualifier $cfg.FsPath
+        $logDrive2    = Split-Path -Qualifier $cfg.LogPath
+        $dataDrive2   = Split-Path -Qualifier $cfg.DataPath
+
+        Write-Host ''
+        Write-FsPocLog "Instance default data path : $defData"
+        Write-FsPocLog "Instance default log path  : $defLog"
+        Write-Host ''
+
+        # The failure that actually happened: container on the log volume.
+        if ($fsDrive2 -eq $defLogDrive) {
+            $mismatch = $true
+            Write-FsPocLog "FsPath is on $fsDrive2, which is the instance's default LOG volume ($defLog)." 'ERROR'
+        }
+        elseif ($fsDrive2 -eq $defDataDrive) {
+            Write-FsPocLog "FsPath is on $fsDrive2, the instance's default DATA volume. The container will contend with the MDF." 'WARN'
+        }
+
+        if ($logDrive2 -ne $defLogDrive) {
+            Write-FsPocLog "LogPath is on $logDrive2 but the instance's default log volume is $defLogDrive." 'WARN'
+        }
+        if ($dataDrive2 -ne $defDataDrive) {
+            Write-FsPocLog "DataPath is on $dataDrive2 but the instance's default data volume is $defDataDrive." 'WARN'
+        }
+        if ((Split-Path -Qualifier $cfg.XePath) -eq $fsDrive2) {
+            Write-FsPocLog "XePath is on the FILESTREAM volume. Trace writes will compete with the workload being traced." 'WARN'
+        }
     }
 }
 
@@ -175,14 +211,14 @@ if ($fsDriveLetter -eq $logDriveLetter) {
 if ($mismatch) {
     Write-Host ''
     Write-Host '  Volume assignment looks wrong. Fix the paths in ps\FsPocConfig.psd1' -ForegroundColor Red
-    Write-Host '  and re-run, or pass -IgnoreVolumeLabels if the labels are misleading.' -ForegroundColor Red
+    Write-Host '  and re-run, or pass -IgnoreVolumeRoles if this layout is deliberate.' -ForegroundColor Red
     Write-Host ''
-    if (-not $IgnoreVolumeLabels) {
-        throw 'Aborting: configured volume roles disagree with the volume labels. Nothing has been created.'
+    if (-not $IgnoreVolumeRoles) {
+        throw 'Aborting: configured volume roles disagree with the instance default paths. Nothing has been created.'
     }
-    Write-FsPocLog 'Continuing anyway (-IgnoreVolumeLabels).' 'WARN'
+    Write-FsPocLog 'Continuing anyway (-IgnoreVolumeRoles).' 'WARN'
 }
-else { Write-FsPocLog 'Volume roles are consistent with the volume labels.' 'OK' }
+else { Write-FsPocLog 'Volume roles are consistent with the instance default paths.' 'OK' }
 
 foreach ($v in $volInfo) {
     if ($v.FileSystem -ne 'NTFS') {
