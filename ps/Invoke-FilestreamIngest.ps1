@@ -191,7 +191,14 @@ $worker = {
     $sw     = New-Object System.Diagnostics.Stopwatch
     $swAll  = New-Object System.Diagnostics.Stopwatch
     $key    = "w$WorkerId"
-    $Progress[$key] = @{ Bytes = [long]0; Files = [long]0; Errors = [long]0; Done = $false; LastError = '' }
+    $Progress[$key] = @{
+        Bytes = [long]0; Files = [long]0; Errors = [long]0; Done = $false
+        LastError = ''
+        # Structured failures. Exceptions are caught per file so they never
+        # reach the runspace's error stream -- without this the caller sees a
+        # count and nothing else, which is useless for diagnosis.
+        ErrorList = New-Object System.Collections.ArrayList
+    }
     $me     = $Progress[$key]
 
     $csv = New-Object System.IO.StreamWriter($TimingCsv, $false, [System.Text.Encoding]::UTF8)
@@ -250,6 +257,9 @@ $worker = {
             $openMs = 0.0; $writeMs = 0.0; $commitMs = 0.0
             $tx = $null
             $skip = $false
+            $stage = 'start'
+            $diagPath = ''      # PathName() returned by SQL Server
+            $diagCtx  = -1      # length of the FILESTREAM transaction context
 
             try {
                 switch -Wildcard ($Scenario) {
@@ -261,7 +271,9 @@ $worker = {
                         $name    = "$($item.Bucket)/w$WorkerId/$($rowGuid.ToString('N')).bin"
 
                         $sw.Restart()
+                        $stage = 'begin-transaction'
                         $tx  = $conn.BeginTransaction()
+                        $stage = 'usp_BeginFileStreamInsert'
                         $cmd = $conn.CreateCommand()
                         $cmd.Transaction   = $tx
                         $cmd.CommandType   = [System.Data.CommandType]::StoredProcedure
@@ -275,12 +287,26 @@ $worker = {
 
                         $rdr = $cmd.ExecuteReader()
                         if (-not $rdr.Read()) { $rdr.Close(); throw 'usp_BeginFileStreamInsert returned no row' }
+
+                        # Read both values defensively and report precisely
+                        # which one was missing. A NULL PathName means the
+                        # FILESTREAM value was NULL rather than 0x; a NULL
+                        # transaction context means the transaction is not
+                        # FILESTREAM-enabled. Casting a DBNull straight to
+                        # [byte[]] would throw a conversion error that names
+                        # neither cause.
+                        $stage = 'read PathName / transaction context'
+                        if ($rdr.IsDBNull(0)) { $rdr.Close(); throw 'PathName() returned NULL -- the FILESTREAM column is NULL, not 0x' }
                         $fsPath = $rdr.GetString(0)
+                        $diagPath = $fsPath
+                        if ($rdr.IsDBNull(1)) { $rdr.Close(); throw 'GET_FILESTREAM_TRANSACTION_CONTEXT() returned NULL -- no FILESTREAM-enabled transaction on this connection' }
                         $fsCtx  = [byte[]]$rdr.GetValue(1)
+                        $diagCtx = $fsCtx.Length
                         $rdr.Close()
                         $sw.Stop(); $openMs = $sw.Elapsed.TotalMilliseconds
 
                         $sw.Restart()
+                        $stage = 'SqlFileStream open'
                         $alloc = if ($Preallocate) { [long]$size } else { [long]0 }
                         $sfs = New-Object System.Data.SqlTypes.SqlFileStream(
                                     $fsPath, $fsCtx,
@@ -288,6 +314,7 @@ $worker = {
                                     [System.Data.SqlTypes.SqlFileStreamOptions]::SequentialScan,
                                     $alloc)
                         try {
+                            $stage = 'SqlFileStream write'
                             $remaining = $size
                             while ($remaining -gt 0) {
                                 $n   = [int][Math]::Min([long]$ChunkBytes, $remaining)
@@ -302,6 +329,7 @@ $worker = {
                         finally { $sfs.Close(); $sfs.Dispose() }
                         $sw.Stop(); $writeMs = $sw.Elapsed.TotalMilliseconds
 
+                        $stage = 'commit'
                         $sw.Restart(); $tx.Commit(); $sw.Stop()
                         $commitMs = $sw.Elapsed.TotalMilliseconds
                         $tx.Dispose(); $tx = $null
@@ -445,9 +473,27 @@ $worker = {
             }
             catch {
                 $me['Errors']++
-                $me['LastError'] = $_.Exception.Message
+                $ex = $_.Exception
+                $inner = ''
+                $probe = $ex.InnerException
+                while ($probe) { $inner += "$($probe.GetType().Name): $($probe.Message); "; $probe = $probe.InnerException }
+
+                $me['LastError'] = "[$stage] $($ex.GetType().Name): $($ex.Message)"
+                $null = $me['ErrorList'].Add([pscustomobject]@{
+                    WorkerId   = $WorkerId
+                    Seq        = $seq
+                    Stage      = $stage
+                    Bucket     = $item.Bucket
+                    SizeBytes  = $item.SizeBytes
+                    Exception  = $ex.GetType().FullName
+                    Message    = $ex.Message
+                    Inner      = $inner
+                    PathName   = $diagPath
+                    ContextLen = $diagCtx
+                })
+
                 if ($tx) { try { $tx.Rollback() } catch { }; try { $tx.Dispose() } catch { }; $tx = $null }
-                # 25 consecutive-ish failures means something structural is wrong
+                # Repeated failures mean something structural is wrong
                 # (permissions, disk full, FILESTREAM level). Stop the whole run
                 # rather than burn an hour producing garbage.
                 if ($me['Errors'] -gt 25) { $Control['Stop'] = $true; $Control['FatalWorker'] = $WorkerId; break }
@@ -584,7 +630,32 @@ Write-Host '----------------------------------------------------------------' -F
 Write-FsPocLog ("Elapsed     : {0}" -f $runSw.Elapsed.ToString('hh\:mm\:ss')) 'OK'
 Write-FsPocLog ("Transferred : {0} in {1:N0} files" -f (Format-FsPocBytes $bytes), $files) 'OK'
 Write-FsPocLog ("Throughput  : {0:N1} MB/s  ({1:N1} files/s)" -f (($bytes / 1MB) / $sec), ($files / $sec)) 'OK'
-if ($errors -gt 0) { Write-FsPocLog "Errors      : $errors (see worker error output above)" 'WARN' }
+if ($errors -gt 0) {
+    Write-FsPocLog "Errors      : $errors" 'ERROR'
+
+    $allErrors = @($final | ForEach-Object { $_['ErrorList'] } | ForEach-Object { $_ })
+    if ($allErrors.Count -gt 0) {
+        $errCsv = Join-Path $resultsDir 'errors.csv'
+        $allErrors | Export-Csv -LiteralPath $errCsv -NoTypeInformation -Encoding UTF8
+
+        Write-Host ''
+        Write-Host '--- Failures, grouped ------------------------------------------' -ForegroundColor Red
+        $allErrors | Group-Object Stage, Exception, Message |
+            Sort-Object Count -Descending | Select-Object -First 5 | ForEach-Object {
+                $e = $_.Group[0]
+                Write-Host ''
+                Write-Host ("  x{0}  at stage: {1}" -f $_.Count, $e.Stage) -ForegroundColor Red
+                Write-Host ("        {0}" -f $e.Exception) -ForegroundColor Yellow
+                Write-Host ("        {0}" -f $e.Message) -ForegroundColor Yellow
+                if ($e.Inner)    { Write-Host ("        inner: {0}" -f $e.Inner) -ForegroundColor DarkYellow }
+                if ($e.PathName) { Write-Host ("        PathName()  : {0}" -f $e.PathName) -ForegroundColor DarkGray }
+                if ($e.ContextLen -ge 0) { Write-Host ("        context len : {0} bytes" -f $e.ContextLen) -ForegroundColor DarkGray }
+            }
+        Write-Host ''
+        Write-FsPocLog "Full detail for all $($allErrors.Count) failures: $errCsv" 'INFO'
+        Write-FsPocLog "For a single-file step-by-step diagnosis, run: .\Test-FilestreamPath.ps1" 'INFO'
+    }
+}
 
 if (-not $NoMonitorDb) {
     Invoke-FsPocSql -Instance $cfg.SqlInstance -Database $cfg.MonitorDb -NonQuery `

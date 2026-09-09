@@ -229,8 +229,15 @@ try {
     $r = & (Join-Path $ScriptDir 'Invoke-FilestreamIngest.ps1') `
             -Scenario Filestream -TargetGB 0.05 -Threads 2 -SizeProfile Medium `
             -ConfigPath $ConfigPath -NoMonitorDb
-    if ($r.Errors -gt 0) { Write-FsPocLog "Smoke test completed with $($r.Errors) errors." 'WARN' }
-    else { Write-FsPocLog ("Smoke test OK: {0} in {1:N0} files at {2:N1} MB/s" -f (Format-FsPocBytes $r.Bytes), $r.Files, $r.ThroughputMBs) 'OK' }
+    if ($r.Errors -gt 0 -or $r.Files -eq 0) {
+        Write-FsPocLog "Smoke test FAILED: $($r.Files) file(s) written, $($r.Errors) error(s)." 'ERROR'
+        Write-Host ''
+        Write-Host '  Setup is NOT complete. The streaming path does not work yet.' -ForegroundColor Red
+        Write-Host '  Run the single-file diagnostic for a step-by-step trace:' -ForegroundColor Yellow
+        Write-Host "      powershell.exe -ExecutionPolicy Bypass -File $ScriptDir\Test-FilestreamPath.ps1" -ForegroundColor Yellow
+        throw "SqlFileStream smoke test failed ($($r.Errors) errors, $($r.Files) files written)."
+    }
+    Write-FsPocLog ("Smoke test OK: {0} in {1:N0} files at {2:N1} MB/s" -f (Format-FsPocBytes $r.Bytes), $r.Files, $r.ThroughputMBs) 'OK'
 }
 catch {
     Write-FsPocLog "Smoke test FAILED: $($_.Exception.Message)" 'ERROR'
