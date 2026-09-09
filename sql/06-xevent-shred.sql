@@ -22,7 +22,11 @@ SET NOCOUNT ON;
 USE FsPocMonitor;
 GO
 
+-- The DROP is in its own batch on purpose. SELECT ... INTO a temp table that
+-- already exists at compile time fails with "There is already an object named
+-- '#xe'", which is what happens on the second run inside one sqlcmd session.
 IF OBJECT_ID('tempdb..#xe') IS NOT NULL DROP TABLE #xe;
+GO
 
 SELECT CONVERT(xml, event_data) AS ed, file_name, file_offset
 INTO #xe
@@ -32,6 +36,7 @@ PRINT 'Events read: ' + CONVERT(varchar(20), (SELECT COUNT(*) FROM #xe));
 GO
 
 IF OBJECT_ID('tempdb..#ev') IS NOT NULL DROP TABLE #ev;
+GO
 
 SELECT
     EventName  = ed.value('(/event/@name)[1]', 'nvarchar(100)'),

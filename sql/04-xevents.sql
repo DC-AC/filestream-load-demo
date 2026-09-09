@@ -51,6 +51,36 @@ BEGIN
 END
 GO
 
+/*  Verify every event and action exists on THIS build before creating the
+    session. A single unavailable object makes the whole CREATE fail, and the
+    error names the session rather than the offending object, which is a poor
+    place to start debugging. */
+DECLARE @required TABLE (ObjName sysname, ObjType varchar(20));
+INSERT @required (ObjName, ObjType) VALUES
+    ('wait_info', 'event'), ('wait_info_external', 'event'),
+    ('file_write_completed', 'event'), ('file_read_completed', 'event'),
+    ('databases_log_flush', 'event'), ('sql_transaction', 'event'),
+    ('error_reported', 'event'),
+    ('session_id', 'action'), ('database_id', 'action'), ('sql_text', 'action');
+
+DECLARE @absent nvarchar(max);
+SELECT @absent = STUFF((
+    SELECT ', ' + r.ObjType + ' ' + r.ObjName
+    FROM @required r
+    WHERE NOT EXISTS (
+        SELECT 1 FROM sys.dm_xe_objects o
+        WHERE o.name = r.ObjName
+          AND o.object_type = r.ObjType
+          AND o.capabilities_desc IS NOT NULL)
+    FOR XML PATH(''), TYPE).value('.', 'nvarchar(max)'), 1, 2, '');
+
+IF @absent IS NOT NULL
+BEGIN
+    RAISERROR('Extended Events objects unavailable on this SQL Server build: %s. Remove them from 04-xevents.sql and re-run.', 16, 1, @absent);
+    SET NOEXEC ON;
+END
+GO
+
 CREATE EVENT SESSION [$(SessionName)] ON SERVER
 
 /* ---- Cooperative waits: WRITELOG, PAGEIOLATCH, LOGBUFFER, FS_* latches ---- */
@@ -119,14 +149,20 @@ WITH
     MAX_MEMORY               = 64MB,
     EVENT_RETENTION_MODE     = ALLOW_SINGLE_EVENT_LOSS,
     MAX_DISPATCH_LATENCY     = 5 SECONDS,
-    MAX_EVENT_SIZE           = 0,
     MEMORY_PARTITION_MODE    = PER_CPU,
     TRACK_CAUSALITY          = ON,
     STARTUP_STATE            = OFF
+    -- MAX_EVENT_SIZE is deliberately NOT specified. Zero is its default, but
+    -- stating it explicitly is rejected: the option may only be set when
+    -- MEMORY_PARTITION_MODE = NONE, so specifying it at all alongside PER_CPU
+    -- fails with "The event session option, max_event_size, has an invalid
+    -- value" (msg 25703). Omitting it keeps both the default and PER_CPU.
 );
 GO
 
 PRINT 'Created event session $(SessionName). Target: $(XePath)\$(SessionName).xel';
 PRINT 'Ensure $(XePath) exists and the SQL Server service account can write to it.';
 PRINT 'Start with: ALTER EVENT SESSION [$(SessionName)] ON SERVER STATE = START;';
+GO
+SET NOEXEC OFF;
 GO
