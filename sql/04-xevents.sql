@@ -152,11 +152,13 @@ WITH
     MEMORY_PARTITION_MODE    = PER_CPU,
     TRACK_CAUSALITY          = ON,
     STARTUP_STATE            = OFF
-    -- MAX_EVENT_SIZE is deliberately NOT specified. Zero is its default, but
-    -- stating it explicitly is rejected: the option may only be set when
-    -- MEMORY_PARTITION_MODE = NONE, so specifying it at all alongside PER_CPU
-    -- fails with "The event session option, max_event_size, has an invalid
-    -- value" (msg 25703). Omitting it keeps both the default and PER_CPU.
+    -- MAX_EVENT_SIZE is deliberately NOT specified.
+    --
+    -- Zero is its default, but the option exists to permit single events
+    -- LARGER than MAX_MEMORY, so an explicitly supplied value has to exceed
+    -- MAX_MEMORY. Stating 0 against MAX_MEMORY = 64MB is therefore an invalid
+    -- value and fails with msg 25703. Omitting the option leaves it at its
+    -- default, which is what was wanted in the first place.
 );
 GO
 

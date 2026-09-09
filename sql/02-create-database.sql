@@ -85,9 +85,20 @@ ALTER DATABASE [$(DbName)] SET AUTO_CLOSE OFF;
 ALTER DATABASE [$(DbName)] SET AUTO_SHRINK OFF;
 ALTER DATABASE [$(DbName)] SET AUTO_CREATE_STATISTICS ON;
 ALTER DATABASE [$(DbName)] SET AUTO_UPDATE_STATISTICS ON;
--- Accelerated Database Recovery interacts with FILESTREAM GC; leave OFF for a
--- clean first measurement, then flip it on as a second data point.
-ALTER DATABASE [$(DbName)] SET ACCELERATED_DATABASE_RECOVERY = OFF;
+GO
+
+/*  Accelerated Database Recovery interacts with FILESTREAM garbage collection;
+    leave it OFF for a clean first measurement, then flip it on as a second
+    data point.
+
+    ADR is SQL Server 2019+ and this is the only 2019-only syntax in the kit.
+    It is executed dynamically because the batch would fail to PARSE on 2016 or
+    2017 even inside an IF that never runs. On earlier versions the setting
+    simply does not exist and there is nothing to turn off. */
+IF CONVERT(int, PARSENAME(CONVERT(nvarchar(128), SERVERPROPERTY('ProductVersion')), 4)) >= 15
+    EXEC(N'ALTER DATABASE [$(DbName)] SET ACCELERATED_DATABASE_RECOVERY = OFF;');
+ELSE
+    PRINT 'Pre-2019 instance: Accelerated Database Recovery not applicable.';
 GO
 
 /* Optional second FILESTREAM container on a different disk.
