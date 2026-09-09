@@ -32,6 +32,16 @@ $cfg = Get-FsPocConfig -Path $ConfigPath
 $step = 0
 function Step { param([string] $Name) $script:step++; Write-Host ''; Write-Host ("[$script:step] $Name") -ForegroundColor Cyan }
 function Detail { param([string] $Text, [string] $Colour = 'Gray') Write-Host "      $Text" -ForegroundColor $Colour }
+function Report-NonFatal {
+    # Informational steps report and continue. Only the streaming test itself
+    # is allowed to be fatal: a diagnostic that aborts before reaching the
+    # thing being diagnosed is worthless.
+    param([string] $What, [System.Exception] $Ex)
+    Write-Host "      could not determine $What" -ForegroundColor Yellow
+    Write-Host ("      {0}: {1}" -f $Ex.GetType().Name, $Ex.Message) -ForegroundColor DarkYellow
+    Write-Host '      (continuing -- this step is informational)' -ForegroundColor DarkGray
+}
+
 function Explain {
     param([System.Exception] $Ex)
     Write-Host ''
@@ -66,6 +76,9 @@ catch { Write-Host '  SqlFileStream type could not be resolved.' -ForegroundColo
 
 # ---------------------------------------------------------------------------
 Step 'Instance FILESTREAM configuration'
+$fsLevel = -1
+$srv = $null; $r = $null; $d = $null
+try {
 $srv = Invoke-FsPocSql -Instance $cfg.SqlInstance -Database 'master' -Query @'
 SELECT
     Version    = CONVERT(nvarchar(64), SERVERPROPERTY('ProductVersion')),
@@ -78,23 +91,29 @@ $r = $srv.Rows[0]
 Detail ("SQL version    : {0}" -f $r.Version)
 Detail ("Effective level: {0}   Configured: {1}" -f $r.Level, $r.Configured)
 Detail ("Share name     : {0}" -f $r.ShareName)
-if ([int]$r.Level -lt 2) {
+$fsLevel = [int]$r.Level
+if ($fsLevel -lt 2) {
     Write-Host '  Effective level is below 2. The Win32 streaming open will be refused.' -ForegroundColor Red
     Write-Host '  Enable it at the Windows level and RESTART the SQL Server service.' -ForegroundColor Red
-    return
 }
+}
+catch { Report-NonFatal 'instance FILESTREAM configuration' $_.Exception }
 
 # ---------------------------------------------------------------------------
 Step "Database configuration ($($cfg.DemoDb))"
+try {
+# The FILESTREAM per-database settings live in sys.database_filestream_options.
+# sys.databases exposes neither non_transacted_access_desc nor directory_name.
 $db = Invoke-FsPocSql -Instance $cfg.SqlInstance -Database $cfg.DemoDb -Query @'
 SELECT
-    NonTransactedAccess = d.non_transacted_access_desc,
-    DirectoryName       = d.directory_name,
-    ContainerPath       = (SELECT TOP 1 physical_name FROM sys.database_files WHERE type = 2),
+    NonTransactedAccess = ISNULL(fo.non_transacted_access_desc, N'(not set)'),
+    DirectoryName       = ISNULL(fo.directory_name, N'(not set)'),
+    ContainerPath       = ISNULL((SELECT TOP 1 physical_name FROM sys.database_files WHERE type = 2), N'(no FILESTREAM file)'),
     FsFileCount         = (SELECT COUNT(*) FROM sys.database_files WHERE type = 2),
     ProcExists          = CASE WHEN OBJECT_ID('dbo.usp_BeginFileStreamInsert') IS NULL THEN 0 ELSE 1 END,
     TableExists         = CASE WHEN OBJECT_ID('dbo.FileStore') IS NULL THEN 0 ELSE 1 END
-FROM sys.databases d WHERE d.database_id = DB_ID()
+FROM (SELECT 1 AS one) AS anchor
+LEFT JOIN sys.database_filestream_options fo ON fo.database_id = DB_ID()
 '@
 $d = $db.Rows[0]
 Detail ("Container       : {0}" -f $d.ContainerPath)
@@ -105,10 +124,11 @@ Detail ("dbo.FileStore   : {0}" -f $(if ([int]$d.TableExists) { 'present' } else
 Detail ("usp_BeginFileStreamInsert : {0}" -f $(if ([int]$d.ProcExists) { 'present' } else { 'MISSING' })) $(if ([int]$d.ProcExists) { 'Gray' } else { 'Red' })
 if (-not [int]$d.ProcExists -or -not [int]$d.TableExists) {
     Write-Host '  Re-run sql\02-create-database.sql.' -ForegroundColor Red
-    return
 }
 if (Test-Path -LiteralPath $d.ContainerPath) { Detail 'Container directory is visible to this client: yes' 'Green' }
 else { Detail 'Container directory is NOT visible from this client path.' 'Yellow' }
+}
+catch { Report-NonFatal 'database FILESTREAM configuration' $_.Exception }
 
 # ---------------------------------------------------------------------------
 Step 'Open connection and begin transaction'
@@ -119,7 +139,7 @@ $tx = $null
 $rowGuid = [guid]::NewGuid()
 try {
     $conn.Open()
-    Detail ("Connected. SPID via server: {0}" -f $conn.ServerVersion) 'Green'
+    Detail ("Connected. Server protocol version: {0}" -f $conn.ServerVersion) 'Green'
     $tx = $conn.BeginTransaction()
     Detail 'BeginTransaction: ok' 'Green'
 
@@ -160,7 +180,9 @@ try {
     }
 
     $unc = Split-Path -Parent $fsPath
-    Detail ("Server share root  : \\{0}\{1}" -f $r.MachineName, $r.ShareName)
+    if ($null -ne $r) {
+        Detail ("Server share root  : \\{0}\{1}" -f $r.MachineName, $r.ShareName)
+    }
     Detail ("Path parent visible: {0}" -f (Test-Path -LiteralPath $unc)) 'DarkGray'
 
     # -----------------------------------------------------------------------
