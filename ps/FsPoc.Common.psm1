@@ -62,7 +62,12 @@ function Get-FsPocConnectionString {
 function Write-FsPocLog {
     [CmdletBinding()]
     param(
+        # Both positions are explicit. Declaring Position on only ONE parameter
+        # makes every other parameter named-only, which silently breaks the
+        # positional call form used throughout this kit:
+        #     Write-FsPocLog 'message' 'STEP'
         [Parameter(Mandatory, Position = 0)] [string] $Message,
+        [Parameter(Position = 1)]
         [ValidateSet('INFO', 'WARN', 'ERROR', 'STEP', 'OK')] [string] $Level = 'INFO'
     )
     $ts = (Get-Date).ToString('HH:mm:ss')
@@ -132,6 +137,8 @@ function Invoke-FsPocSql {
         $da = New-Object System.Data.SqlClient.SqlDataAdapter $cmd
         $dt = New-Object System.Data.DataTable
         $null = $da.Fill($dt)
+        # The comma IS required here: a DataTable is enumerable, so without it
+        # PowerShell unrolls it into DataRows and callers lose $result.Rows.
         , $dt
     }
     finally { $conn.Dispose() }
@@ -175,7 +182,7 @@ function Get-FsPocSizeProfile {
 
     $one = $all | Where-Object Bucket -eq $Profile
     $one.ByteShare = 1.0
-    , $one
+    $one
 }
 
 function Get-FsPocWorkPlan {
@@ -199,7 +206,11 @@ function Get-FsPocWorkPlan {
             BytesPerWorker   = [long]([Math]::Ceiling($bucketBytes / $Threads))
         }
     }
-    , @($plan)
+    # Deliberately NOT comma-wrapped. `, @($plan)` would emit a single Object[]
+    # into the pipeline, so `Get-FsPocWorkPlan ... | Measure-Object TargetBytes`
+    # would silently return null instead of summing the buckets. Callers that
+    # need a guaranteed array on assignment wrap with @() at the call site.
+    $plan
 }
 
 function Write-FsPocWorkPlan {
@@ -257,6 +268,8 @@ function New-FsPocRandomPool {
     finally { $rng.Dispose() }
     $sw.Stop()
     Write-FsPocLog ("Source pool ready in {0:N1}s" -f $sw.Elapsed.TotalSeconds) 'OK'
+    # The comma IS required here: without it PowerShell unrolls the byte[] and
+    # emits every single byte as a pipeline item.
     , $pool
 }
 

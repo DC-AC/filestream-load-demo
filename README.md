@@ -57,6 +57,9 @@ ps/
   Measure-ProcmonLog.ps1     Procmon CSV analysis
   Import-PocTimings.ps1      Bulk-loads per-file timings into FsPocMonitor
 
+tests/
+  Test-FsPocKit.ps1          Parse + parameter-binding + execution checks
+
 procmon/README.md            Procmon column/filter setup (one-time, manual)
 ```
 
@@ -258,6 +261,28 @@ duration and log management change substantially. `WRITELOG` in the section 2
 analysis is where that will show up.
 
 ---
+
+## Validating changes before you copy the kit to the VM
+
+```
+pwsh -File .\tests\Test-FsPocKit.ps1
+```
+
+Runs three levels of check, because the first is not sufficient on its own and
+this kit has been bitten twice by that:
+
+1. **Parse** — every script parses, the config loads.
+2. **Binding** — every call site to a module function actually binds. A parse
+   check happily accepts `Write-FsPocLog 'msg' 'STEP'` against a function whose
+   second parameter is named-only; it then fails on the first call at runtime.
+   The parser has no opinion about parameter binding.
+3. **Execution** — every platform-independent function is invoked in the forms
+   the scripts use.
+
+It runs under PowerShell 7 on any OS. It does **not** cover the `SqlFileStream`
+path, WMI FILESTREAM enablement, or anything else needing Windows and SQL
+Server — `Setup-FilestreamPoc.ps1` ends with a real 50 MB smoke test through
+`SqlFileStream` on the VM, and that is the check that actually matters.
 
 ## Known gotchas
 

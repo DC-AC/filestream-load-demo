@@ -104,7 +104,7 @@ Write-FsPocLog "Results    : $resultsDir"
 # ---------------------------------------------------------------------------
 # Work plan
 # ---------------------------------------------------------------------------
-$plan = Get-FsPocWorkPlan -TargetGB $cfg.TargetGB -Profile $cfg.SizeProfile -Threads $cfg.Threads
+$plan = @(Get-FsPocWorkPlan -TargetGB $cfg.TargetGB -Profile $cfg.SizeProfile -Threads $cfg.Threads)
 Write-FsPocWorkPlan -Plan $plan
 if ($WhatIfPlan) { Write-FsPocLog 'WhatIfPlan set -- stopping before any work.' 'OK'; return }
 
