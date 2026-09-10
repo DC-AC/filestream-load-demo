@@ -52,6 +52,8 @@ ps/
   Setup-FilestreamPoc.ps1    One-time VM prep + smoke test
   Reset-FilestreamPoc.ps1    Full teardown before a rebuild (dry run by default)
   Test-FilestreamPath.ps1    Single-file step-by-step SqlFileStream diagnostic
+  Get-CrashEvidence.ps1      Bugcheck vs platform reset, filter drivers, AV
+  Get-BugcheckAnalysis.ps1   Runs !analyze -v and names the faulting driver
   Invoke-PocRun.ps1          <- entry point
   Invoke-FilestreamIngest.ps1  The ingest/read engine
   Start-PocCapture.ps1       XEvents + Perfmon + windowed Procmon
@@ -311,7 +313,52 @@ next `CREATE` fails. Reset reads the real file locations from
 `sys.master_files` rather than trusting the config, which matters precisely
 when the config is what you just changed.
 
+## Known platform issue: bugcheck 0x18 during FILESTREAM ingest
+
+On the first target VM (Windows Server 2022, build 20348.4294, SQL Server 2019
+15.0.4470.1) the machine bugchecked twice during ingest with
+`0x18 REFERENCE_BY_POINTER`. `!analyze -v` on the minidumps gave an identical
+signature both times:
+
+```
+disk!DiskFlushDispatch                  flush IRP heading to the disk
+storport!Raid*                          completing
+nt!IofCompleteRequest
+Ntfs!NtfsFlushCompletionRoutine
+Ntfs!NtfsIoPerfCollectFlushData
+Ntfs!FsLibIoPerfNotifyHighLatency       <- NTFS recorded a slow I/O
+Ntfs!NtfsIoPerfPostFileObjectLatency
+Ntfs!NtfsIoPerfPostFileObjectInfo       <- and faulted while recording it
+nt!ObfReferenceObject                   -> 0x18
+```
+
+NTFS observes a high-latency flush, enters its I/O telemetry path to record it,
+and references a file object whose count is already zero.
+
+**This is a Windows NTFS defect, not FILESTREAM, not antivirus, and not this
+kit.** A user-mode program cannot corrupt a kernel object's reference count; it
+can only issue I/O that reaches the defective path. `MODULE_NAME: disk` is a
+red herring — `!analyze` attributes the fault to the driver owning the IRP,
+which on a completion-path fault sits several frames below the code that
+faulted.
+
+What helps:
+
+| Action | Effect |
+|---|---|
+| Latest Windows cumulative update | May carry a fix; no public KB matches this signature |
+| Microsoft support case with the dump | The signature is specific enough to be actionable |
+| Faster disk tier / lower latency | Triggers on *high-latency* flushes, so fewer are reached |
+| Fewer commits (batch files per transaction) | Each commit forces a durability flush |
+
+None of the last two are fixes; they reduce how often the path is reached.
+
+`ps\Get-CrashEvidence.ps1` establishes whether a restart was a bugcheck or a
+platform reset. `ps\Get-BugcheckAnalysis.ps1` runs `!analyze -v` and classifies
+the result from the whole stack rather than `MODULE_NAME` alone.
+
 ## Known gotchas
+
 
 - The FILESTREAM container's **leaf folder must not exist** before
   `CREATE DATABASE` — SQL Server creates it. The parent must exist. If a drop
