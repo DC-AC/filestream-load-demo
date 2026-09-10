@@ -25,6 +25,7 @@ param(
     [string] $ConfigPath,
     [switch] $RestartSqlService,
     [switch] $SkipDatabase,
+    [switch] $SkipSmokeTest,
     [switch] $ApplyNtfsTuning,
     [switch] $IgnoreVolumeRoles
 )
@@ -312,6 +313,12 @@ foreach ($script in '01-instance-config.sql', '02-create-database.sql', '03-moni
 # ---------------------------------------------------------------------------
 # 5. End-to-end smoke test of the actual streaming path
 # ---------------------------------------------------------------------------
+if ($SkipSmokeTest) {
+    Write-FsPocLog 'Step 5: smoke test SKIPPED (-SkipSmokeTest).' 'WARN'
+    Write-FsPocLog 'The streaming path is unverified. Run Test-FilestreamPath.ps1 when ready.' 'WARN'
+    return
+}
+
 Write-FsPocLog 'Step 5: SqlFileStream smoke test' 'STEP'
 try {
     $r = & (Join-Path $ScriptDir 'Invoke-FilestreamIngest.ps1') `
