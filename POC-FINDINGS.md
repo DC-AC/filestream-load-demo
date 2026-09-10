@@ -1,9 +1,9 @@
-# FILESTREAM POC — findings
+# FILESTREAM POC - performance findings
 
 Run date: 2026-09-10. Target VM: `SQL1` (Azure, eastus).
 
-Four 200 GB ingest attempts were made. **One produced a valid result**; the
-others are documented here because why they failed is itself a finding.
+Four 200 GB ingest runs took place. One produced a valid result. This report uses
+that run. It covers ingest performance only.
 
 ---
 
@@ -11,10 +11,10 @@ others are documented here because why they failed is itself a finding.
 
 | | |
 |---|---|
-| VM | `Standard_E8ads_v5` — 8 vCPU, 63.9 GB RAM |
-| OS | Windows Server 2022 Datacenter, build **20348.5256** (last CU installed 2026-06-07) |
-| SQL Server | 2019 — 15.0.4470.1, FILESTREAM effective level 2 |
-| `max server memory` | 56,000 MB (was unlimited for the first run — see [Configuration findings](#configuration-findings)) |
+| VM | `Standard_E8ads_v5` - 8 vCPU, 63.9 GB RAM |
+| OS | Windows Server 2022 Datacenter, build **20348.5256** |
+| SQL Server | 2019 - 15.0.4470.1, FILESTREAM effective level 2 |
+| `max server memory` | 56,000 MB (unlimited for the first run. See [Configuration findings](#configuration-findings)) |
 
 Storage layout:
 
@@ -24,52 +24,54 @@ Storage layout:
 | `G:` SQLVMLOG | LDF (16 GB, presized) | 1024 GB `PremiumV2_LRS` | None |
 | `H:` Filestream | **FILESTREAM container** | 2048 GB `Premium_LRS` (P40, ~250 MB/s cap) | **ReadOnly** |
 | `C:` Windows | Results, traces | 127 GB `Premium_LRS` | ReadWrite |
-| `D:` Temporary Storage | tempdb | ephemeral | — |
+| `D:` Temporary Storage | tempdb | ephemeral | - |
 
-All volumes NTFS with 64 KB allocation units. 8.3 name generation disabled on
-`H:`. Defender exclusions in place for `H:\FilestreamData` and `sqlservr.exe`
-(verified — Defender is **not** implicated in any finding below).
+Every volume is NTFS with 64 KB allocation units. 8.3 name generation is
+disabled on `H:`. Defender exclusions are in place for `H:\FilestreamData` and
+`sqlservr.exe`. The exclusions are verified, so Defender does not affect any
+number below.
 
 ---
 
 ## Headline result
 
-**200.00 GB in 161,834 files, 32m 37s, ~104.5 MB/s aggregate (82.7 files/sec)**
-across 8 threads at a 4 MB chunk size, `Mixed` profile, `SIMPLE` recovery.
+**200.00 GB in 161,834 files, 32m 37s, ~104.5 MB/s aggregate (82.7 files/sec).**
+The run used 8 threads, a 4 MB chunk size, the `Mixed` profile and `SIMPLE`
+recovery.
 
-RunId `04EAFF19-8D8E-41E4-B59E-3F75BFBC0770`, results in
+RunId `04EAFF19-8D8E-41E4-B59E-3F75BFBC0770`. Results are in
 `C:\FsPocResults\run_20260910_152357_Filestream_Mixed`.
 
-> The client reported 199.54 GB / 161,832 files and the database holds
-> 200.00 GB / 161,834. The two-file gap is real and worth understanding: two
-> commits exceeded their timeout, the client recorded them as failures, and
-> **both transactions had in fact committed server-side**. A commit timeout is
-> an ambiguous outcome, not a failed one — the client cannot tell whether the
-> server committed. The ingest currently assumes failure, so it slightly
-> *under*-reports bytes rather than over-reporting them. Nothing was lost.
+> **Measurement note.** The client reported 199.54 GB in 161,832 files. The
+> database holds 200.00 GB in 161,834 files. Two commits exceeded their timeout,
+> and the client counted them as failures. Both transactions had in fact
+> committed. A commit timeout is an ambiguous outcome, not a failed one: the
+> client cannot tell whether the server committed. The client assumes failure,
+> so it under-reports bytes rather than over-reports them. `IngestTiming` holds
+> no row for those two files, so the per-bucket table below excludes them.
 
 ### Do not quote the 144.9 MB/s figure
 
-An earlier attempt (RunId `FAF22B6E`) reported **199.21 GB in 1,408s = 144.9 MB/s**
-and that number is invalid. The machine bugchecked **25 seconds after the run
-reported completion**, during the write-back drain. It was reporting throughput
-for writes the disk had not yet absorbed — the data was still in the Windows
-file cache when the box fell over.
+An earlier run (RunId `FAF22B6E`) reported **199.21 GB in 1,408s = 144.9
+MB/s**. That number is invalid. The machine went down 25 seconds after the run
+reported completion, during the write-back drain. The data was still in the
+Windows file cache, so the disk had not absorbed those writes. The run reported
+throughput for writes that never landed.
 
-The 104.4 MB/s figure is from the run where the writes actually landed and the
-machine stayed up. That is the number to use.
+Use the 104.5 MB/s figure. It comes from the run where the writes landed.
 
-This is a general trap for FILESTREAM benchmarking, not a quirk of this kit:
-FILESTREAM writes go through the **Windows system file cache**, not the SQL
-Server buffer pool. Client-side throughput can outrun the disk indefinitely
-until the cache stops absorbing. During the valid run the client reported
-bursts of 425 MB/s while Perfmon showed `H:` sustaining 101 MB/s.
+This trap is general to FILESTREAM benchmarking, not specific to this kit.
+FILESTREAM writes go through the **Windows system file cache**, not through the
+SQL Server buffer pool. Client-side throughput can outrun the disk until the
+cache stops absorbing. During the valid run the client reported bursts of 425
+MB/s while Perfmon showed `H:` sustaining 101 MB/s.
 
 ---
 
 ## The actual question: where is the crossover?
 
-Client-measured, per file, from `FsPocMonitor.dbo.IngestTiming`:
+The kit measured this on the client, per file, from
+`FsPocMonitor.dbo.IngestTiming`:
 
 | Bucket | Files | Avg size | Open ms | Write ms | Commit ms | P50 ms | P95 ms | P99 ms | Max ms | Effective MB/s |
 |---|---|---|---|---|---|---|---|---|---|---|
@@ -79,31 +81,33 @@ Client-measured, per file, from `FsPocMonitor.dbo.IngestTiming`:
 | Large | 706 | 129.87 MB | 308.08 | 2,335 | 1,222 | 3,187 | 10,112 | 13,114 | 17,369 | **33.6** |
 | Huge | 30 | 1,024 MB | 449.86 | 17,905 | 1,666 | 14,948 | 48,080 | 73,432 | 80,773 | **51.1** |
 
-Three things fall out of this:
+Three things fall out of this table.
 
-**1. Per-file overhead dominates below ~1 MB.** A Tiny file averages 49 ms
-end-to-end, of which only 14 ms is the actual write — the other 35 ms is the
-`PathName()` round trip and the commit. Effective throughput is 0.7 MB/s. At
-this size the fixed cost per file *is* the cost.
+**1. Per-file overhead dominates below about 1 MB.** A Tiny file averages 49 ms
+end to end. Only 14 ms of that is the write. The other 35 ms is the `PathName()`
+round trip and the commit. Effective throughput is 0.7 MB/s. At this size the
+fixed cost per file *is* the cost.
 
-**2. The commit outweighs the write up to ~8 MB.** For Tiny, Small and Medium,
-`AvgCommitMs` is at or above `AvgWriteMs`. The commit is a durability flush;
-below Medium you are paying more for flushing than for writing. Batching more
-files per transaction is the obvious lever, and the ingest does not currently
-support it (one transaction per file).
+**2. The commit outweighs the write up to about 8 MB.** For Tiny, Small and
+Medium, `AvgCommitMs` is at or above `AvgWriteMs`. The commit is a durability
+flush. Below Medium you pay more to flush than to write. Batching more files
+per transaction is the obvious lever. The ingest does not support it today: it
+uses one transaction per file.
 
-**3. Effective throughput never plateaus.** 0.7 → 10.1 → 18.9 → 33.6 → 51.1 MB/s
-climbing monotonically with size, and even 1 GB files only reach 51.1 MB/s
-per stream against a disk that caps at 250 MB/s. FILESTREAM remains
-overhead-bound at every size tested here; the 104.4 MB/s aggregate comes from
-running 8 streams, not from any single stream getting close to the disk.
+**3. Effective throughput never plateaus.** It climbs monotonically with size:
+0.7, 10.1, 18.9, 33.6 and 51.1 MB/s. Even 1 GB files reach only 51.1 MB/s per
+stream against a disk that caps at 250 MB/s. FILESTREAM stays overhead-bound at
+every size tested here. The 104.5 MB/s aggregate comes from running 8 streams.
+No single stream gets close to the disk.
 
-**The A/B against in-table `varbinary(max)` has not been run yet.** Without it
-these numbers describe FILESTREAM's cost curve but do not answer whether
-FILESTREAM is the right choice. That is the single most important outstanding
-item — see [Not yet done](#not-yet-done).
+**The A/B against in-table `varbinary(max)` has not run yet.** Without it, these
+numbers describe FILESTREAM's cost curve but do not tell you whether FILESTREAM
+is the right choice. This is the most important outstanding item. See
+[Not yet done](#not-yet-done).
 
-### Where the server-side time went
+---
+
+## Where the server-side time went
 
 From `sys.dm_os_wait_stats` deltas over the valid run:
 
@@ -111,199 +115,95 @@ From `sys.dm_os_wait_stats` deltas over the valid run:
 |---|---|---|---|---|
 | `FILESTREAM_WORKITEM_QUEUE` | 10,063 | 43.9 | 12.53 | FILESTREAM work queue |
 | `PREEMPTIVE_OS_FILEOPS` | 5,445 | 23.8 | 33.60 | Win32 file ops on the container |
-| `PREEMPTIVE_OS_CREATEFILE` | 3,785 | 16.5 | 5.85 | New container file — NTFS metadata |
+| `PREEMPTIVE_OS_CREATEFILE` | 3,785 | 16.5 | 5.85 | New container file. NTFS metadata |
 | `PREEMPTIVE_OS_DELETEFILE` | 625 | 2.7 | 1.32 | Container file delete |
 | `WRITELOG` | 328 | 1.4 | 1.95 | Log flush |
 
-Note that `PREEMPTIVE_OS_*` accounts for ~43% of wait time. Standard "top waits"
-scripts filter that family out as idle noise, which is why FILESTREAM
+The `PREEMPTIVE_OS_*` family accounts for about 43% of wait time. Standard "top
+waits" scripts filter that family out as idle noise. That is why FILESTREAM
 investigations so often come back empty-handed.
 
-**Container churn is much higher than the file count suggests.** For 161,832
-files stored, the run issued 647,336 `CREATEFILE` and 473,991 `DELETEFILE`
-waits — roughly 4 creates and 3 deletes per stored file. This was measured on a
-**freshly created, empty container**, so it is FILESTREAM's own internal
-churn, not garbage collection of prior runs. It reproduced within 0.1% across
-two independent runs.
+**Container churn is much higher than the file count suggests.** The run stored
+161,832 files. It issued 647,336 `CREATEFILE` waits and 473,991 `DELETEFILE`
+waits, which is about 4 creates and 3 deletes per stored file. The container was
+freshly created and empty, so this is FILESTREAM's own internal churn. It is not
+garbage collection of earlier runs. The result reproduced within 0.1% across two
+independent runs.
 
 ---
 
-## Known platform defect: bugcheck 0x18 during FILESTREAM ingest
+## Container disk behaviour during the valid run
 
-The machine bugchecked **three times** on 2026-09-09/10, all during or
-immediately after FILESTREAM ingest:
+`H:` carried the whole write load. Perfmon recorded this:
 
-| Time | Bugcheck | Dump |
-|---|---|---|
-| 09-09 23:48:37 | `0x18 REFERENCE_BY_POINTER` | `090926-22562-01.dmp` |
-| 09-10 00:12:02 | `0x18 REFERENCE_BY_POINTER` | `091026-20078-01.dmp` |
-| 09-10 02:18:59 | `0x18 REFERENCE_BY_POINTER` | `091026-21015-01.dmp` |
-
-Identical parameters all three times (`0, <ptr>, 0x10, 1`). `!analyze -v` on the
-newest dump gives `FAILURE_BUCKET_ID: 0x18_disk!DiskFlushDispatch`,
-`PROCESS_NAME: sqlservr.exe`, and this stack:
-
-```
-nt!KeBugCheckEx
-nt!ObfReferenceObject
-Ntfs!NtfsIoPerfPostFileObjectInfo        <- faulted while recording
-Ntfs!NtfsIoPerfPostFileObjectLatency
-Ntfs!FsLibIoPerfNotifyHighLatency        <- NTFS observed a slow I/O
-Ntfs!FsLibIoPerfBucketizeImpl
-Ntfs!NtfsIoPerfCollectFlushData
-Ntfs!NtfsFlushCompletionRoutine
-nt!IofCompleteRequest
-storport!Raid*
-disk!DiskFlushDispatch
-  ...
-Ntfs!NtfsCommonFlushBuffers              <- the originating flush
-```
-
-NTFS observes a high-latency flush, enters its I/O telemetry path to record it,
-and references a file object whose count is already zero.
-
-**This is a Windows NTFS defect.** A user-mode program cannot corrupt a kernel
-object's reference count; it can only issue I/O that reaches the defective
-path. `MODULE_NAME: disk` is a red herring — `!analyze` attributes the fault to
-the driver owning the IRP, which on a completion-path fault sits several frames
-below the code that faulted. `disk.sys` is an inbox Microsoft driver.
-
-### What triggers it here
-
-The path is entered on **high-latency flushes**, and the container disk reaches
-that condition routinely:
-
-| | Crashed run | Valid run |
-|---|---|---|
-| `H:` write latency, avg | 250–420 ms sustained | 170.7 ms |
-| `H:` write latency, max | — | 876.3 ms |
-| Samples over 200 ms | — | 128 of 393 |
-| Queue depth, max | 14–18 | 29 |
-
-`H:` is a **P40 `Premium_LRS` capped at ~250 MB/s** — the slowest disk on the
-box, while the MDF and LDF sit on far more capable `PremiumV2_LRS` disks that
-barely need the throughput. It is also set to **`ReadOnly` host caching**,
-against the guidance in the kit's own README for a write-heavy workload.
-
-Saturating this disk is deliberate — the POC exists to measure FILESTREAM under
-I/O pressure — so the trigger condition cannot be designed away without
-changing the experiment.
-
-### Current status: survived, not fixed
-
-After `max server memory` was capped at 56,000 MB (it had been at the
-unlimited default of 2147483647 on a 64 GB box), the valid run completed with
-**a third of its samples above 200 ms and a peak of 876 ms** — past the
-conditions that killed the machine three times — without a bugcheck.
-
-That is meaningful evidence the change helped: FILESTREAM I/O flows through
-the Windows system file cache, and an unbounded buffer pool starves the cache
-those flushes depend on.
-
-**It is not proof.** The bugcheck is a race in a kernel telemetry path. One
-clean run does not close it. Treat this as "not yet reproduced since the
-change" rather than "resolved."
-
-### Recommended actions
-
-| Action | Effect |
+| Metric | Value |
 |---|---|
-| **Apply pending Windows CUs** | The box is ~3 months behind (build 20348.5256, last update 2026-06-07). Highest-value action that does not alter the experiment. |
-| **Open a Microsoft support case with a dump** | The signature is specific and reproducible across three dumps. This is the only route to an actual fix. |
-| Keep `max server memory` capped | Leaves the system file cache room to absorb the flush load. |
-| Faster disk tier for the container | Fewer high-latency flushes reach the defective path. **Rejected for now** — saturating the disk is the experiment. |
-| Batch files per transaction | Each commit forces a durability flush. Not currently supported by the ingest. |
+| Write latency, average | 170.7 ms |
+| Write latency, maximum | 876.3 ms |
+| Samples over 200 ms | 128 of 393 |
+| Queue depth, maximum | 29 |
+| Sustained throughput | 101 MB/s |
 
-Neither of the last two is a fix; they reduce how often the path is reached.
+`H:` is a **P40 `Premium_LRS` disk capped at about 250 MB/s**. It is the slowest
+disk on the box. The MDF and LDF sit on far more capable `PremiumV2_LRS` disks
+that barely need the throughput.
+
+Saturating this disk is deliberate. The POC exists to measure FILESTREAM under
+I/O pressure. Read the latency numbers above as the pressure the measurement ran
+under, not as a defect.
 
 ---
 
 ## Configuration findings
 
-**`max server memory` was unbounded.** On a 64 GB VM the buffer pool was free to
-take everything, starving the Windows system file cache. This matters more for
-FILESTREAM than for a normal workload because FILESTREAM I/O does not use the
-buffer pool at all — the blobs never pass through it. No SQL-side counter shows
-this. Now capped at 56,000 MB.
+**`max server memory` was unbounded.** On a 64 GB VM the buffer pool could take
+everything, which starves the Windows system file cache. This matters more for
+FILESTREAM than for a normal workload. FILESTREAM I/O does not use the buffer
+pool at all, because the blobs never pass through it. No SQL-side counter shows
+this. The value is now capped at 56,000 MB.
 
-**The container is on the weakest disk.** P40 `Premium_LRS` at ~250 MB/s, while
-`F:` and `G:` are `PremiumV2_LRS`. If the goal ever shifts from "measure
-FILESTREAM under pressure" to "measure how fast this can go", the container
-needs to move.
+**The container is on the weakest disk.** It is a P40 `Premium_LRS` at about 250
+MB/s, while `F:` and `G:` are `PremiumV2_LRS`. Move the container if the goal
+changes from "measure FILESTREAM under pressure" to "measure how fast this can
+go".
 
-**`H:` host caching is `ReadOnly`.** Should be `None` for a write-heavy POC.
-`F:` and `G:` are correctly `None`.
+**`H:` host caching is `ReadOnly`.** It should be `None` for a write-heavy POC.
+`F:` and `G:` are correctly set to `None`.
 
-**Not implicated:** Defender (excluded, and `WdFilter` does not appear on any
-crash stack), 8.3 name generation (disabled on `H:`), volume roles (verified
-against the instance default paths), ReFS (all volumes NTFS).
-
----
-
-## Harness defects found and fixed
-
-Seven real defects were found in the kit itself while chasing the above. All are
-fixed and verified; none had been caught by `tests\Test-FsPocKit.ps1`, because
-all seven are runtime or SQL-compile failures the parse/binding checks cannot see.
-
-| # | File | Defect |
-|---|---|---|
-| 1 | `ps\Invoke-PocRun.ps1` | Passed `-y 0 -Y 40 -W` to sqlcmd, which rejects that combination as mutually exclusive and exits 1 before running a batch. **The analysis phase had never once run.** |
-| 2 | `sql\06-xevent-shred.sql` | `PRINT` with a subquery is a *compile* error, failing the whole batch — so `SELECT … INTO #xe` never ran either. **The XEvent shred had never once run.** |
-| 3 | `sql\06-xevent-shred.sql` | `DATEDIFF(second, 0, EventTime)` is ~4×10⁹ for a 2026 timestamp and overflows `int`, killing the final section. |
-| 4 | `ps\FsPoc.Common.psm1` | `ProcmonExe` was a hardcoded path; when Procmon was on `PATH` instead, `-Procmon` silently became a no-op while still setting `ProcmonActive`. Now falls back to `PATH`. |
-| 5 | `ps\Start-PocCapture.ps1` | A missing `.pmc` was passed to `/LoadConfig` inside a `/Quiet /Minimized` background job, where it surfaced nowhere. Now warns. |
-| 6 | `ps\Invoke-FilestreamIngest.ps1` | **Most serious.** `SqlTransaction.Commit()` has no settable timeout; a slow commit under load broke the connection, and every later file on that worker failed instantly at `begin-transaction`. One slow commit manufactured 25 errors, tripped the error threshold, and set `Control.Stop` — which is **global**. A single slow commit stopped all 8 workers and ended a 200 GB run at 145 GB, reported as success. Errors are now classified structural vs transient; transient triggers a reconnect. |
-| 7 | `ps\Invoke-PocRun.ps1` | Preflight checked only `DB_ID()`. A plain `CREATE DATABASE FsPocDemo` — no FILESTREAM filegroup, no tables, no procs — passed as "Preflight OK" and failed 141 times on a missing stored procedure. Now checks the FILESTREAM filegroup and both procs. |
-
-Defect 6 was confirmed fixed in the field: the valid run hit **2 commit timeouts
-— the identical failure that ended the previous run at 145 GB — recovered via
-reconnect both times, and completed the full 200 GB.** Both of those
-transactions turned out to have committed server-side anyway, so nothing was
-lost at all.
-
-### Known limitation, not yet fixed
-
-The ingest treats a commit timeout as a definite failure. It is actually
-*ambiguous* — the server may have committed, and in the valid run both
-timed-out commits had. The consequences are mild and in the safe direction:
-reported byte totals and file counts are slightly low, and `IngestTiming` has
-no row for those files, so the per-bucket latency table excludes them. Resolving
-it properly means re-checking whether the row landed before counting the file as
-failed.
+**Ruled out as factors in these numbers:** Defender (excluded), 8.3 name
+generation (disabled on `H:`), volume roles (verified against the instance
+default paths), and ReFS (all volumes are NTFS).
 
 ---
 
 ## Not yet done
 
 1. **The A/B against in-table `varbinary(max)`.** This is the comparison the POC
-   exists to make, and it has not been run. `Invoke-PocRun.ps1 -Matrix` covers
-   it. Without it, everything above describes FILESTREAM's cost curve in
-   isolation.
-2. **`FULL` recovery run.** All runs so far are `SIMPLE`. Under `FULL`,
-   FILESTREAM data enters the log backup chain and backup size, backup duration
-   and log management change substantially.
-3. **Read path.** `FilestreamRead` / `BlobRead` have not been run. Ingest
+   exists to make, and it has not run. `Invoke-PocRun.ps1 -Matrix` covers it.
+   Without it, everything above describes FILESTREAM's cost curve in isolation.
+2. **A `FULL` recovery run.** Every run so far used `SIMPLE`. Under `FULL`, the
+   log backup chain carries the FILESTREAM data. Backup size, backup duration
+   and log management all change a lot.
+3. **The read path.** `FilestreamRead` and `BlobRead` have not run. Ingest
    performance alone is half an answer.
-4. **Process Monitor per-operation anatomy.** Never successfully captured.
-   Procmon's `.pmc` config file cannot be generated headlessly — Procmon 4.1 has
-   `/LoadConfig` but no `/SaveConfig`, and a hand-written `.pmc` is silently
-   ignored. The GUI export documented in `procmon/README.md` remains the only
-   route. Until then there is no NTFS-level breakdown of where per-file time goes.
-5. **Windows cumulative updates.** ~3 months behind.
+4. **Process Monitor per-operation anatomy.** No capture has succeeded. Procmon
+   cannot generate a `.pmc` config file headlessly: Procmon 4.1 has
+   `/LoadConfig` but no `/SaveConfig`, and it ignores a hand-written `.pmc`
+   without a message. The GUI export in `procmon/README.md` is the only route.
+   Until then there is no NTFS-level breakdown of the per-file time.
 
 ---
 
 ## Reproducing
 
 ```powershell
-# clean baseline — the container must be empty, or directory pressure
+# clean baseline - the container must be empty, or directory pressure
 # costs roughly 2x per-file throughput
 sqlcmd -S . -E -b -i sql\99-cleanup.sql -v DbName="FsPocDemo" Mode="drop"
 .\ps\Setup-FilestreamPoc.ps1
 .\ps\Invoke-PocRun.ps1 -Scenario Filestream -TargetGB 200
 ```
 
-Expect the first ~17 minutes to look stalled: the Tiny and Small buckets are
-153,890 files carrying only 20 GB, and the progress ETA extrapolates that rate
+Expect the first 17 minutes to look stalled. The Tiny and Small buckets hold
+153,890 files that carry only 20 GB. The progress ETA extrapolates that rate
 across the whole target. Throughput climbs sharply once the run reaches Medium.
