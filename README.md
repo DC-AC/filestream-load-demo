@@ -51,6 +51,7 @@ ps/
   FsPoc.Common.psm1          Shared helpers, workload planner, random pool
   Setup-FilestreamPoc.ps1    One-time VM prep + smoke test
   Reset-FilestreamPoc.ps1    Full teardown before a rebuild (dry run by default)
+  Invoke-PocAnalysis.ps1     Re-run analysis for a finished load (no re-load)
   Test-FilestreamPath.ps1    Single-file step-by-step SqlFileStream diagnostic
   Get-CrashEvidence.ps1      Bugcheck vs platform reset, filter drivers, AV
   Get-BugcheckAnalysis.ps1   Runs !analyze -v and names the faulting driver
@@ -312,6 +313,28 @@ runs, and a container left over from a previous build is the usual reason the
 next `CREATE` fails. Reset reads the real file locations from
 `sys.master_files` rather than trusting the config, which matters precisely
 when the config is what you just changed.
+
+## If something fails after the load finishes
+
+Do not re-run the load. Everything the analysis needs is durable the moment
+the ingest returns: the `start` and `end` snapshots are committed to
+`FsPocMonitor`, the per-file timings are already written to per-worker CSVs in
+the run folder, and the Procmon and `.xel` files are on disk.
+
+```powershell
+.\ps\Invoke-PocAnalysis.ps1 -List     # every run, and which artefacts survive
+.\ps\Invoke-PocAnalysis.ps1           # analyse the newest completed run
+.\ps\Invoke-PocAnalysis.ps1 -ConvertProcmon   # also do the expensive PML -> CSV
+```
+
+`-List` reports, per run, how many of the two wait snapshots exist, how many
+timing rows are imported, and which files remain in the run folder. A run
+showing 2/2 wait snapshots has everything the SQL analysis needs, whatever
+happened afterwards.
+
+The PML to CSV conversion is opt-in because it is single-threaded and writes a
+file that can exceed the trace itself — a poor thing to trigger unintentionally
+on a machine that is already unstable under I/O load.
 
 ## Known platform issue: bugcheck 0x18 during FILESTREAM ingest
 
