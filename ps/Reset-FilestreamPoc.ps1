@@ -23,7 +23,13 @@
 param(
     [string] $ConfigPath,
     [switch] $Execute,
-    [string[]] $AlsoRemove = @()
+    [string[]] $AlsoRemove = @(),
+    # DROP DATABASE on a FILESTREAM database deletes the whole container
+    # synchronously, so it can legitimately take minutes. It can also block
+    # forever behind a session or a handle. A finite timeout distinguishes the
+    # two; the default Invoke-FsPocSql timeout of 0 means "wait forever", which
+    # tells you nothing.
+    [int] $TimeoutSeconds = 900
 )
 
 Set-StrictMode -Version Latest
@@ -33,6 +39,30 @@ if (-not $ConfigPath) { $ConfigPath = Join-Path $ScriptDir 'FsPocConfig.psd1' }
 Import-Module (Join-Path $ScriptDir 'FsPoc.Common.psm1') -Force
 
 $cfg = Get-FsPocConfig -Path $ConfigPath
+
+function Show-Blockers {
+    param([string] $Instance)
+    Write-Host ''
+    Write-FsPocLog 'Active requests and blockers:' 'STEP'
+    try {
+        $r = Invoke-FsPocSql -Instance $Instance -Database 'master' -CommandTimeout 30 -Query @'
+SELECT
+    r.session_id, r.command, r.status, r.wait_type,
+    WaitSec  = r.wait_time / 1000,
+    Blocker  = r.blocking_session_id,
+    DbName   = DB_NAME(r.database_id),
+    PctDone  = r.percent_complete
+FROM sys.dm_exec_requests r
+WHERE r.session_id > 50
+'@
+        if ($r.Rows.Count -eq 0) { Write-Host '      (no user requests active)' -ForegroundColor Gray }
+        foreach ($row in $r.Rows) {
+            Write-Host ("      spid {0,-5} {1,-16} {2,-12} wait={3,-28} {4,5}s  blocked-by={5}  {6}" -f `
+                $row.session_id, $row.command, $row.status, $row.wait_type, $row.WaitSec, $row.Blocker, $row.DbName) -ForegroundColor Gray
+        }
+    }
+    catch { Write-FsPocLog "Could not read active requests: $($_.Exception.Message)" 'WARN' }
+}
 
 Write-Host ''
 Write-Host '================================================================' -ForegroundColor Cyan
@@ -76,15 +106,54 @@ foreach ($db in $dbs) {
                 -Query "SELECT Present = CASE WHEN DB_ID(N'$db') IS NULL THEN 0 ELSE 1 END"
     if ([int]$exists.Rows[0].Present -eq 0) { continue }
 
-    if ($Execute) {
-        Write-FsPocLog "Dropping $db ..." 'STEP'
-        Invoke-FsPocSql -Instance $cfg.SqlInstance -Database 'master' -NonQuery -Query @"
-ALTER DATABASE [$db] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;
-DROP DATABASE [$db];
-"@ | Out-Null
+    if (-not $Execute) { Write-FsPocLog "WOULD DROP database $db" 'WARN'; continue }
+
+    # Report what the drop has to delete. A container holding hundreds of
+    # thousands of small NTFS files takes real time to remove, and knowing the
+    # count up front is the difference between "slow" and "stuck".
+    $fsDirs = @($info.Rows | Where-Object FileType -eq 'FILESTREAM' | ForEach-Object { $_.PhysicalPath })
+    foreach ($fsDir in $fsDirs) {
+        try {
+            $inv = Get-ChildItem -LiteralPath $fsDir -Recurse -File -ErrorAction SilentlyContinue |
+                   Measure-Object Length -Sum
+            if ($inv.Count -gt 0) {
+                Write-FsPocLog ("Container holds {0:N0} file(s), {1}. The drop must delete all of them." -f `
+                    $inv.Count, (Format-FsPocBytes $inv.Sum)) 'INFO'
+            }
+        }
+        catch { }
+    }
+
+    # Two statements, run separately, so the log says which one is slow.
+    Write-FsPocLog "Setting $db to SINGLE_USER ..." 'STEP'
+    try {
+        Invoke-FsPocSql -Instance $cfg.SqlInstance -Database 'master' -NonQuery -CommandTimeout $TimeoutSeconds `
+            -Query "ALTER DATABASE [$db] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;" | Out-Null
+        Write-FsPocLog "$db is SINGLE_USER" 'OK'
+    }
+    catch {
+        Write-FsPocLog "SET SINGLE_USER did not complete: $($_.Exception.Message)" 'ERROR'
+        Show-Blockers -Instance $cfg.SqlInstance
+        throw
+    }
+
+    Write-FsPocLog "Dropping $db (deleting the container can take minutes) ..." 'STEP'
+    try {
+        Invoke-FsPocSql -Instance $cfg.SqlInstance -Database 'master' -NonQuery -CommandTimeout $TimeoutSeconds `
+            -Query "DROP DATABASE [$db];" | Out-Null
         Write-FsPocLog "Dropped $db" 'OK'
     }
-    else { Write-FsPocLog "WOULD DROP database $db" 'WARN' }
+    catch {
+        Write-FsPocLog "DROP DATABASE did not complete within $TimeoutSeconds s: $($_.Exception.Message)" 'ERROR'
+        Show-Blockers -Instance $cfg.SqlInstance
+        Write-Host ''
+        Write-Host '  If nothing is blocking, the drop is simply deleting a very large' -ForegroundColor Yellow
+        Write-Host '  container. Re-run with a longer -TimeoutSeconds, or take the database' -ForegroundColor Yellow
+        Write-Host '  offline and remove the container from the filesystem instead:' -ForegroundColor Yellow
+        Write-Host ("      ALTER DATABASE [$db] SET OFFLINE WITH ROLLBACK IMMEDIATE;") -ForegroundColor Gray
+        Write-Host ("      DROP DATABASE [$db];") -ForegroundColor Gray
+        throw
+    }
 }
 
 # ---------------------------------------------------------------------------
