@@ -26,6 +26,7 @@ param(
     [switch] $RestartSqlService,
     [switch] $SkipDatabase,
     [switch] $SkipSmokeTest,
+    [switch] $AddDefenderExclusions,
     [switch] $ApplyNtfsTuning,
     [switch] $IgnoreVolumeRoles
 )
@@ -258,6 +259,38 @@ if ($lastAccess -notmatch '=\s*[13]') {
         Write-FsPocLog 'Disabled last-access updates (reboot to take full effect).' 'OK'
     }
 }
+
+<#  Defender exclusions are checked rather than merely suggested.
+
+    This machine bugchecked twice with 0x18 REFERENCE_BY_POINTER during
+    FILESTREAM streaming, with WdFilter and RsFx both attached to the container
+    volume and no exclusions configured. Excluding the container removes
+    Defender's minifilter from that I/O path. It is also required for the
+    measurement to mean anything: real-time scanning treats every FILESTREAM
+    file as a brand-new file on disk, because it is one.
+#>
+try {
+    $pref = Get-MpPreference -ErrorAction Stop
+    $existing = @($pref.ExclusionPath)
+    $procs    = @($pref.ExclusionProcess)
+    $needPath = -not ($existing -contains $cfg.FsPath)
+    $needProc = -not ($procs -contains 'sqlservr.exe')
+
+    if ($needPath -or $needProc) {
+        Write-FsPocLog 'Windows Defender exclusions are NOT configured for the FILESTREAM container.' 'WARN'
+        if ($AddDefenderExclusions) {
+            if ($needPath) { Add-MpPreference -ExclusionPath $cfg.FsPath; Write-FsPocLog "Excluded path $($cfg.FsPath)" 'OK' }
+            if ($needProc) { Add-MpPreference -ExclusionProcess 'sqlservr.exe'; Write-FsPocLog 'Excluded process sqlservr.exe' 'OK' }
+        }
+        else {
+            Write-Host ("      Add-MpPreference -ExclusionPath '{0}'" -f $cfg.FsPath) -ForegroundColor White
+            Write-Host  "      Add-MpPreference -ExclusionProcess 'sqlservr.exe'" -ForegroundColor White
+            Write-FsPocLog 'Or re-run this script with -AddDefenderExclusions.' 'INFO'
+        }
+    }
+    else { Write-FsPocLog 'Defender exclusions for the FILESTREAM container are in place.' 'OK' }
+}
+catch { Write-FsPocLog "Could not query Defender preferences: $($_.Exception.Message)" 'WARN' }
 
 Write-Host ''
 Write-FsPocLog 'Manual checks this script cannot make for you:' 'WARN'
