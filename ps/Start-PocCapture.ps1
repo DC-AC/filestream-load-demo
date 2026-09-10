@@ -180,6 +180,16 @@ if ($Procmon) {
         $pml = Join-Path $ResultsDir 'procmon.pml'
         $state.ProcmonPml = $pml
 
+        # A missing .pmc is worth catching here. Procmon runs inside a background
+        # job with /Quiet /Minimized, so a bad /LoadConfig argument surfaces
+        # nowhere -- the job exits and the trace is empty or unfiltered, which is
+        # only discovered when Measure-ProcmonLog finds nothing to report.
+        if ($ProcmonConfig -and -not (Test-Path -LiteralPath $ProcmonConfig)) {
+            Write-FsPocLog "ProcmonConfig not found: $ProcmonConfig" 'WARN'
+            Write-FsPocLog 'Capturing WITHOUT it -- no column/filter setup, so the CSV may lack the Duration column that Measure-ProcmonLog.ps1 needs. See procmon/README.md.' 'WARN'
+            $ProcmonConfig = $null
+        }
+
         # A background job so the ingest keeps running: wait out the ramp-up,
         # capture for the window, then terminate cleanly.
         $job = Start-Job -Name "FsPocProcmon_$($RunId.ToString('N').Substring(0,8))" -ScriptBlock {

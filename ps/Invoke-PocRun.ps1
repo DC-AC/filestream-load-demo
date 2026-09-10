@@ -81,11 +81,28 @@ $sqlDir = Join-Path (Split-Path -Parent $ScriptDir) 'sql'
 # run, or -- worse -- producing numbers from a half-configured instance.
 # ---------------------------------------------------------------------------
 try {
+    <#  The database EXISTING is not the same as it being the right database.
+
+        A plain "CREATE DATABASE FsPocDemo" satisfies DB_ID() and nothing else:
+        no FILESTREAM filegroup, no FileStore/BlobStore, no procs. Checking only
+        DB_ID() let that through, and the run then failed 141 times on a missing
+        stored procedure before anyone found out. These three extra columns turn
+        that into a one-second failure that names the fix.
+
+        Everything here is readable from master, so nothing needs the database to
+        exist: sys.master_files carries the FILESTREAM file (type 2) for every
+        database, and three-part OBJECT_ID() returns NULL rather than erroring
+        when the database is absent.
+    #>
     $pre = Invoke-FsPocSql -Instance $cfg.SqlInstance -Database 'master' -Query @"
 SELECT
-    FsLevel   = CONVERT(int, SERVERPROPERTY('FilestreamEffectiveLevel')),
-    DemoDb    = CASE WHEN DB_ID(N'$($cfg.DemoDb)')    IS NULL THEN 0 ELSE 1 END,
-    MonitorDb = CASE WHEN DB_ID(N'$($cfg.MonitorDb)') IS NULL THEN 0 ELSE 1 END
+    FsLevel     = CONVERT(int, SERVERPROPERTY('FilestreamEffectiveLevel')),
+    DemoDb      = CASE WHEN DB_ID(N'$($cfg.DemoDb)')    IS NULL THEN 0 ELSE 1 END,
+    MonitorDb   = CASE WHEN DB_ID(N'$($cfg.MonitorDb)') IS NULL THEN 0 ELSE 1 END,
+    FsContainer = (SELECT COUNT(*) FROM sys.master_files
+                   WHERE database_id = DB_ID(N'$($cfg.DemoDb)') AND type = 2),
+    FsProc      = CASE WHEN OBJECT_ID(N'$($cfg.DemoDb).dbo.usp_BeginFileStreamInsert', 'P') IS NULL THEN 0 ELSE 1 END,
+    BlobProc    = CASE WHEN OBJECT_ID(N'$($cfg.DemoDb).dbo.usp_BeginBlobInsert', 'P')       IS NULL THEN 0 ELSE 1 END
 "@
 }
 catch {
@@ -96,6 +113,16 @@ $missing = @()
 if ($pre.Rows[0].FsLevel   -lt 2) { $missing += "FILESTREAM effective level is $($pre.Rows[0].FsLevel); the streaming API needs 2 or higher" }
 if ($pre.Rows[0].DemoDb    -eq 0) { $missing += "database '$($cfg.DemoDb)' does not exist" }
 if ($pre.Rows[0].MonitorDb -eq 0) { $missing += "database '$($cfg.MonitorDb)' does not exist" }
+
+# Only worth reporting when the database is actually there -- otherwise these
+# just restate "it does not exist" three more times.
+if ($pre.Rows[0].DemoDb -eq 1) {
+    if ($pre.Rows[0].FsContainer -eq 0) {
+        $missing += "'$($cfg.DemoDb)' has no FILESTREAM filegroup -- it was created as a plain database, not by sql\02-create-database.sql"
+    }
+    if ($pre.Rows[0].FsProc -eq 0)   { $missing += "'$($cfg.DemoDb)' is missing dbo.usp_BeginFileStreamInsert" }
+    if ($pre.Rows[0].BlobProc -eq 0) { $missing += "'$($cfg.DemoDb)' is missing dbo.usp_BeginBlobInsert" }
+}
 
 if ($missing.Count -gt 0) {
     Write-Host ''
@@ -247,6 +274,19 @@ else {
 }
 
 # ---------------------------------------------------------------------------
+<#  sqlcmd rejects -W together with -y/-Y ("mutually exclusive") and exits 1
+    before running a single batch, so an earlier -y 0 -Y 40 -W here meant the
+    analysis phase never ran at all -- it failed on the usage error, and with
+    $ErrorActionPreference = 'Stop' that took the whole run down after the
+    ingest had already finished.
+
+    -W is the half to keep. It trims trailing padding, and it does NOT truncate
+    variable-length columns the way the 256-char default does, so the wide
+    columns -y 0 was there to protect (06-xevent-shred's ErrorMsg nvarchar(2000)
+    and IoPath nvarchar(400)) still come through whole.
+#>
+$AnalysisFormatArgs = @('-W', '-s', '|')
+
 if (-not $SkipAnalysis) {
     Write-Host ''
     Write-Host '================================================================' -ForegroundColor Cyan
@@ -257,7 +297,7 @@ if (-not $SkipAnalysis) {
         Invoke-FsPocSql -Instance $cfg.SqlInstance `
             -InputFile (Join-Path $sqlDir '05-analysis.sql') `
             -SqlcmdVariables @{ RunId = $r.RunId; TopWaits = 25 } `
-            -ExtraArgs @('-y', '0', '-Y', '40', '-W', '-s', '|') |
+            -ExtraArgs $AnalysisFormatArgs |
             Tee-Object -FilePath $out
         Write-FsPocLog "Analysis saved to $out" 'OK'
     }
@@ -271,7 +311,7 @@ if (-not $SkipAnalysis) {
             Invoke-FsPocSql -Instance $cfg.SqlInstance `
                 -InputFile (Join-Path $sqlDir '06-xevent-shred.sql') `
                 -SqlcmdVariables @{ XePath = $xelDir; SessionName = 'FsPoc_Waits' } `
-                -ExtraArgs @('-y', '0', '-Y', '40', '-W', '-s', '|') |
+                -ExtraArgs $AnalysisFormatArgs |
                 Tee-Object -FilePath $xeOut
             Write-FsPocLog "XEvent analysis saved to $xeOut" 'OK'
         }

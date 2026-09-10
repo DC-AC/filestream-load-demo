@@ -193,6 +193,14 @@ $worker = {
     $key    = "w$WorkerId"
     $Progress[$key] = @{
         Bytes = [long]0; Files = [long]0; Errors = [long]0; Done = $false
+        # Errors are split by kind because they need different responses.
+        # Structural means the environment is wrong -- a missing proc, a denied
+        # path, a full disk -- and every remaining file will fail the same way,
+        # so the run should stop. Transient means the connection died under load
+        # (a commit that outran its timeout is the usual cause here); the right
+        # response is to reconnect and keep going, because this POC exists to
+        # push the disk until exactly that happens.
+        Structural = [long]0; Transient = [long]0; Reconnects = [long]0
         LastError = ''
         # Structured failures. Exceptions are caught per file so they never
         # reach the runspace's error stream -- without this the caller sees a
@@ -493,10 +501,52 @@ $worker = {
                 })
 
                 if ($tx) { try { $tx.Rollback() } catch { }; try { $tx.Dispose() } catch { }; $tx = $null }
-                # Repeated failures mean something structural is wrong
-                # (permissions, disk full, FILESTREAM level). Stop the whole run
-                # rather than burn an hour producing garbage.
-                if ($me['Errors'] -gt 25) { $Control['Stop'] = $true; $Control['FatalWorker'] = $WorkerId; break }
+
+                <#  Classify, then recover.
+
+                    A commit that outruns its timeout leaves the connection
+                    broken, and SqlTransaction.Commit() has no settable timeout
+                    -- ADO.NET commits on an internal default. Every later file
+                    on this worker then fails instantly at begin-transaction
+                    with "the connection is closed", so ONE slow commit used to
+                    manufacture 25 more errors, trip the threshold below, and
+                    set Control.Stop -- which is global. A single slow commit
+                    stopped all eight workers and ended a 200 GB run at 145 GB,
+                    reported as success with 26 errors.
+
+                    On a saturated disk a slow commit is the expected outcome,
+                    not a structural fault, so it must not end the run.
+                #>
+                $chain = "$($ex.Message) $inner"
+                $isTransient =
+                    ($conn.State -ne [System.Data.ConnectionState]::Open) -or
+                    ($chain -match 'Execution Timeout Expired') -or
+                    ($chain -match 'connection is closed') -or
+                    ($chain -match 'transport-level error') -or
+                    ($chain -match 'wait operation timed out')
+
+                if ($isTransient) {
+                    $me['Transient']++
+                    if ($conn.State -ne [System.Data.ConnectionState]::Open) {
+                        try { $conn.Close() } catch { }
+                        try {
+                            $conn.Open()
+                            $me['Reconnects']++
+                        }
+                        catch {
+                            # Cannot get back to the instance at all: that IS structural.
+                            $me['Structural']++
+                        }
+                    }
+                }
+                else { $me['Structural']++ }
+
+                # Structural failures repeat on every remaining file, so stop the
+                # run rather than burn an hour producing garbage. The transient
+                # cap is a backstop against a pathological reconnect loop.
+                if ($me['Structural'] -gt 25 -or $me['Transient'] -gt 500) {
+                    $Control['Stop'] = $true; $Control['FatalWorker'] = $WorkerId; break
+                }
             }
         }
     }
@@ -632,6 +682,21 @@ Write-FsPocLog ("Transferred : {0} in {1:N0} files" -f (Format-FsPocBytes $bytes
 Write-FsPocLog ("Throughput  : {0:N1} MB/s  ({1:N1} files/s)" -f (($bytes / 1MB) / $sec), ($files / $sec)) 'OK'
 if ($errors -gt 0) {
     Write-FsPocLog "Errors      : $errors" 'ERROR'
+
+    # A run that lost connections and recovered is NOT the same as a clean run,
+    # and the throughput number is not comparable to one. Say so here rather
+    # than leaving it to be discovered in errors.csv.
+    $structural = ($final | ForEach-Object { [long]$_['Structural'] } | Measure-Object -Sum).Sum
+    $transient  = ($final | ForEach-Object { [long]$_['Transient']  } | Measure-Object -Sum).Sum
+    $reconnects = ($final | ForEach-Object { [long]$_['Reconnects'] } | Measure-Object -Sum).Sum
+    Write-FsPocLog ("              {0} structural, {1} transient, {2} reconnect(s)" -f $structural, $transient, $reconnects) 'INFO'
+    if ($reconnects -gt 0) {
+        # Say how much was actually lost rather than asserting the run is
+        # "short": one in-flight file per reconnect, which against 160k files is
+        # usually a rounding error. Overstating this trains people to ignore it.
+        Write-FsPocLog ("{0} reconnect(s): the file in flight at each was not written ({0} of {1:N0}). Everything else completed normally." -f $reconnects, $files) 'WARN'
+        Write-FsPocLog 'Commit timeouts under load are the expected symptom of a saturated container disk -- check section 5 of the analysis before treating them as a fault.' 'INFO'
+    }
 
     $allErrors = @($final | ForEach-Object { $_['ErrorList'] } | ForEach-Object { $_ })
     if ($allErrors.Count -gt 0) {
