@@ -166,21 +166,64 @@ foreach ($f in $fields) {
     if ($m.Success) { Write-Host ("  {0,-24} {1}" -f $f, $m.Groups[1].Value.Trim()) -ForegroundColor White }
 }
 
+<#  MODULE_NAME is an attribution, not a diagnosis.
+
+    !analyze blames the driver that owns the IRP, which for a completion-path
+    fault is often several frames below the code that actually faulted. The
+    stack is the evidence, so it is what gets classified here. Getting this
+    wrong is not harmless: an earlier version of this script read MODULE_NAME
+    alone and told the user that disk.sys might be a third-party filter driver
+    they should exclude. disk.sys is an inbox Microsoft driver.
+#>
 $culprit = [regex]::Match($text, "(?m)^MODULE_NAME:\s*(\S+)")
-if ($culprit.Success) {
-    $mod = $culprit.Groups[1].Value
+$mod = if ($culprit.Success) { $culprit.Groups[1].Value } else { '(unknown)' }
+
+$inbox = @('nt', 'ntoskrnl', 'Ntfs', 'disk', 'storport', 'CLASSPNP', 'partmgr',
+           'volmgr', 'volsnap', 'fileinfo', 'FltMgr', 'storahci', 'stornvme')
+
+Write-Host ''
+Write-Host '=== What the stack says ===' -ForegroundColor Cyan
+
+if ($text -match 'Ntfs!.*IoPerf' -or $text -match 'FsLibIoPerf') {
+    Write-Host '  The fault is in NTFS I/O performance telemetry, on an I/O completion path.' -ForegroundColor Yellow
+    Write-Host '  NtfsIoPerf* / FsLibIoPerf* run when NTFS records a high-latency I/O; the' -ForegroundColor Gray
+    Write-Host '  reference count went bad while posting file-object info for that record.' -ForegroundColor Gray
     Write-Host ''
-    switch -Wildcard ($mod) {
-        'RsFx*'    { Write-Host "  The FILESTREAM filter driver ($mod) is implicated. This is a SQL Server" -ForegroundColor Yellow
-                     Write-Host '  driver defect. Apply the latest SQL Server 2019 cumulative update, and' -ForegroundColor Yellow
-                     Write-Host '  open a Microsoft support case with this dump if it persists.' -ForegroundColor Yellow }
-        'WdFilter*'{ Write-Host "  Windows Defender's minifilter ($mod) is implicated. Add the FILESTREAM" -ForegroundColor Yellow
-                     Write-Host '  container and sqlservr.exe to the exclusion list and retry.' -ForegroundColor Yellow }
-        default    { Write-Host "  Faulting module: $mod" -ForegroundColor Yellow
-                     Write-Host '  If that is a third-party filter driver, exclude the FILESTREAM volume' -ForegroundColor Yellow
-                     Write-Host '  from it or uninstall it for the duration of the POC.' -ForegroundColor Yellow }
-    }
+    Write-Host '  This is a Windows NTFS defect, not FILESTREAM, not antivirus, and not' -ForegroundColor Yellow
+    Write-Host '  the workload. A user-mode program cannot corrupt a kernel object' -ForegroundColor Yellow
+    Write-Host '  reference count; it can only issue I/O that reaches the defective path.' -ForegroundColor Yellow
+    Write-Host ''
+    Write-Host '  What to do:' -ForegroundColor White
+    Write-Host '    1. Apply the latest cumulative update for this Windows build.' -ForegroundColor Gray
+    Write-Host '    2. Open a Microsoft support case with this dump. The signature is' -ForegroundColor Gray
+    Write-Host '       specific enough to be actionable.' -ForegroundColor Gray
+    Write-Host '    3. To reduce how often the path is reached, reduce high-latency I/O:' -ForegroundColor Gray
+    Write-Host '       a faster disk tier, or fewer durability flushes by batching more' -ForegroundColor Gray
+    Write-Host '       files per transaction. Neither fixes the defect.' -ForegroundColor Gray
 }
+elseif ($text -match 'RsFx') {
+    Write-Host "  The FILESTREAM filter driver (RsFx) is on the stack. This is a SQL Server" -ForegroundColor Yellow
+    Write-Host '  driver defect. Apply the latest SQL Server cumulative update, and open a' -ForegroundColor Yellow
+    Write-Host '  Microsoft support case with this dump if it persists.' -ForegroundColor Yellow
+}
+elseif ($text -match 'WdFilter') {
+    Write-Host "  Windows Defender's minifilter (WdFilter) is on the stack. Exclude the" -ForegroundColor Yellow
+    Write-Host '  FILESTREAM container and sqlservr.exe and retry.' -ForegroundColor Yellow
+}
+elseif ($inbox -contains $mod) {
+    Write-Host ("  Faulting module: {0} -- an inbox Microsoft driver, NOT third party." -f $mod) -ForegroundColor Yellow
+    Write-Host '  There is nothing to uninstall or exclude. Apply the latest cumulative' -ForegroundColor Gray
+    Write-Host '  update and open a support case with this dump.' -ForegroundColor Gray
+}
+else {
+    Write-Host ("  Faulting module: {0}" -f $mod) -ForegroundColor Yellow
+    Write-Host '  Not recognised as an inbox driver. If it is a third-party filter driver' -ForegroundColor Gray
+    Write-Host '  (antivirus, backup, monitoring), exclude the FILESTREAM volume from it or' -ForegroundColor Gray
+    Write-Host '  uninstall it for the duration of the POC.' -ForegroundColor Gray
+}
+
+Write-Host ''
+Write-Host ("  (MODULE_NAME reported {0}; the classification above is based on the full stack.)" -f $mod) -ForegroundColor DarkGray
 
 # The stack usually names the interacting drivers even when MODULE_NAME does not.
 $stack = [regex]::Match($text, '(?ms)^STACK_TEXT:\s*\r?\n(.*?)\r?\n\s*\r?\n')
