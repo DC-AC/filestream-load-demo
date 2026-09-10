@@ -2,13 +2,13 @@
 
 Run date: 2026-09-10. Target VM: `SQL1` (Azure, eastus).
 
-Five 200 GB ingest runs took place. Two gave valid results. Each valid run used a
-different container disk. This report compares them. It covers ingest performance
-only.
+Six 200 GB ingest runs took place. Three gave valid results. Each valid run used
+a different container disk configuration. This report compares them. It covers
+ingest performance only.
 
-The second disk is 2.6 times faster. It also disproves one conclusion from the
-earlier version of this report. See
-[What the faster disk changed](#what-the-faster-disk-changed).
+Two results matter most. The disk stops being the bottleneck after the first
+upgrade, so the second upgrade buys almost nothing for ingest. Container deletion
+behaves in the opposite way, and it needs IOPS more than it needs bandwidth.
 
 ---
 
@@ -19,16 +19,17 @@ earlier version of this report. See
 | VM | `Standard_E8ads_v5`, 8 vCPU, 63.9 GB RAM |
 | OS | Windows Server 2022 Datacenter, build **20348.5256** |
 | SQL Server | 2019, 15.0.4470.1, FILESTREAM effective level 2 |
-| `max server memory` | 56,000 MB for both valid runs |
+| `max server memory` | 56,000 MB for all three valid runs |
 
-Only the container disk changed between the two runs.
+Only the container disk changed between runs.
 
 | Volume | Role | Disk | Host caching |
 |---|---|---|---|
 | `F:` SQLVMDATA1 | MDF, XEvents | 1024 GB `PremiumV2_LRS` | None |
 | `G:` SQLVMLOG | LDF (16 GB, presized) | 1024 GB `PremiumV2_LRS` | None |
-| `H:` Filestream **(run 1)** | FILESTREAM container | 2048 GB `Premium_LRS` (P40, about 250 MB/s) | ReadOnly |
-| `H:` Filestream **(run 2)** | FILESTREAM container | 2048 GB **`PremiumV2_LRS`** | **None** |
+| `H:` **run 1** | FILESTREAM container | 2048 GB `Premium_LRS` (P40, about 250 MB/s) | ReadOnly |
+| `H:` **run 2** | FILESTREAM container | 2048 GB `PremiumV2_LRS` | None |
+| `H:` **run 3** | FILESTREAM container | 2048 GB `PremiumV2_LRS`, **more IOPS and bandwidth** | None |
 | `C:` Windows | Results, traces | 127 GB `Premium_LRS` | ReadWrite |
 | `D:` Temporary Storage | tempdb | ephemeral | - |
 
@@ -36,41 +37,59 @@ Every volume uses NTFS with 64 KB allocation units. 8.3 name generation is off o
 `H:`. Defender excludes `H:\FilestreamData` and `sqlservr.exe`. We verified those
 exclusions. Defender does not affect any number below.
 
-**Two variables changed, not one.** The disk SKU changed. The host caching
-changed with it. PremiumV2 does not offer host caching, so you cannot separate
-the two. `None` is the correct setting for a write-heavy workload. `ReadOnly`
-never helped writes. Read this result as "new disk configuration", not "SKU
-alone".
+**Runs 1 and 2 differ by two variables, not one.** The disk SKU changed. The host
+caching changed with it. PremiumV2 does not offer host caching, so you cannot
+separate the two. `None` is the correct setting for a write-heavy workload.
+`ReadOnly` never helped writes. Read that step as "new disk configuration", not
+"SKU alone". Runs 2 and 3 use the same SKU, so that step is clean.
 
-A synthetic test measured the PremiumV2 disk at **476.9 MB/s**. The test used 4
-concurrent write-through streams. The run later peaked at 585.3 MB/s. The
-provisioned ceiling is therefore higher than the test reached.
+### Measured disk capability
 
-PremiumV2 sets throughput independently of disk size. The default is 125 MB/s.
-Someone provisioned this disk above that default. A default PremiumV2 disk is
-slower than the P40 it replaced.
+A synthetic test wrote through the cache to `H:` before runs 2 and 3:
+
+| Test | Run 2 disk | Run 3 disk |
+|---|---|---|
+| Sequential, 4 streams, 4 MB blocks | 476.9 MB/s | **561.6 MB/s** |
+| Random write IOPS, 8 threads, 8 KB | not measured | **9,342** |
+
+The sequential test is the only like-for-like comparison, because nobody
+measured IOPS before run 3. An 8-stream variant returned 458.4 MB/s, below the
+4-stream result. Treat that as a limit of the test harness: 8 PowerShell job
+processes compete for 8 vCPUs. The runs themselves peaked higher than either
+test, at 585.3 MB/s and 613.4 MB/s.
+
+PremiumV2 sets throughput and IOPS independently of disk size. Both default low,
+at 125 MB/s. Someone provisioned this disk above that default for run 2, then
+raised it again for run 3. A default PremiumV2 disk is slower than the P40 it
+replaced.
 
 ---
 
 ## Headline result
 
-Both runs wrote exactly 200.00 GB. Both used 8 threads, a 4 MB chunk size, the
-`Mixed` profile and `SIMPLE` recovery. Both wrote into a new, empty container.
+All three runs wrote exactly 200.00 GB. All used 8 threads, a 4 MB chunk size,
+the `Mixed` profile and `SIMPLE` recovery. All wrote into a new, empty container.
 
-| | Run 1: P40 | Run 2: PremiumV2 | Change |
+| | Run 1: P40 | Run 2: PremiumV2 | Run 3: PremiumV2 boosted |
 |---|---|---|---|
-| RunId | `04EAFF19` | `7CDD0CC9` | |
-| Data written | 200.00 GB / 161,834 files | 200.00 GB / 162,051 files | |
-| Elapsed | 32m 38s | **12m 26s** | **2.62x faster** |
-| Throughput | 104.4 MB/s | **274.5 MB/s** | **2.63x** |
-| Files per second | 82.7 | **217.2** | **2.63x** |
-| Errors | 2 commit timeouts | **0** | |
+| RunId | `04EAFF19` | `7CDD0CC9` | `C4F97564` |
+| Files | 161,834 | 162,051 | 162,143 |
+| Elapsed | 32m 38s | 12m 26s | **11m 32s** |
+| Throughput | 104.4 MB/s | 274.5 MB/s | **296.0 MB/s** |
+| Files per second | 82.7 | 217.2 | **234.4** |
+| Errors | 2 commit timeouts | 0 | **0** |
+| Gain over previous | - | **2.63x** | **1.08x** |
 
-The kit randomises file sizes per run, so the file counts differ. Both runs hit
-the 200.00 GB target exactly.
+The kit randomises file sizes per run, so the file counts differ. All three runs
+hit the 200.00 GB target exactly.
 
-Results are in `C:\FsPocResults\run_20260910_152357_Filestream_Mixed` and
-`C:\FsPocResults\run_20260910_184032_Filestream_Mixed`.
+**The returns collapse after run 2.** The first upgrade gave 2.63 times the
+throughput. The second gave 1.08 times, for a disk that measures 18% faster in a
+sequential test. The disk stopped limiting ingest at run 2. See
+[Where the bottleneck sits now](#where-the-bottleneck-sits-now).
+
+Results are in `C:\FsPocResults\run_20260910_152357_Filestream_Mixed`,
+`run_20260910_184032_Filestream_Mixed` and `run_20260910_192014_Filestream_Mixed`.
 
 > **Measurement note on run 1.** The client reported 199.54 GB in 161,832 files.
 > The database holds 200.00 GB in 161,834 files. Two commits passed their
@@ -80,7 +99,7 @@ Results are in `C:\FsPocResults\run_20260910_152357_Filestream_Mixed` and
 > A commit timeout is ambiguous, not failed. The client cannot tell whether the
 > server committed. The client assumes failure, so it under-reports bytes instead
 > of over-reporting them. `IngestTiming` holds no row for those two files, so the
-> per-bucket tables below exclude them. Run 2 had no timeouts.
+> per-bucket tables below exclude them. Runs 2 and 3 had no timeouts.
 
 ### Do not quote the 144.9 MB/s figure
 
@@ -103,72 +122,85 @@ absorbing. In run 1 the client reported bursts of 425 MB/s while Perfmon showed
 ## Where the crossover is
 
 The kit measures this on the client, per file, from
-`FsPocMonitor.dbo.IngestTiming`.
+`FsPocMonitor.dbo.IngestTiming`. Effective MB/s per bucket:
 
-Run 1, P40:
+| Bucket | Avg size | Run 1: P40 | Run 2: PremiumV2 | Run 3: boosted |
+|---|---|---|---|---|
+| Tiny | 0.03 MB | 0.7 | 1.7 | **1.8** |
+| Small | 0.53 MB | 10.1 | 24.7 | **25.8** |
+| Medium | about 8.5 MB | 18.9 | 42.2 | **50.6** |
+| Large | about 135 MB | 33.6 | 145.7 | **175.9** |
+| Huge | about 1,000 MB | 51.1 | 784.7 | **543.8** |
 
-| Bucket | Files | Avg size | Open ms | Write ms | Commit ms | P50 ms | P95 ms | P99 ms | Effective MB/s |
-|---|---|---|---|---|---|---|---|---|---|
-| Tiny | 123,237 | 0.03 MB | 12.27 | 14.14 | 22.77 | 45.83 | 74.01 | 91.59 | **0.7** |
-| Small | 30,653 | 0.53 MB | 12.75 | 14.32 | 25.81 | 42.28 | 79.72 | 221 | **10.1** |
-| Medium | 7,206 | 8.53 MB | 58.45 | 187.59 | 205.86 | 242 | 1,652 | 3,448 | **18.9** |
-| Large | 706 | 129.87 MB | 308.08 | 2,335 | 1,222 | 3,187 | 10,112 | 13,114 | **33.6** |
-| Huge | 30 | 1,024 MB | 449.86 | 17,905 | 1,666 | 14,948 | 48,080 | 73,432 | **51.1** |
+Median latency per file:
 
-Run 2, PremiumV2:
+| Bucket | Run 1: P40 | Run 2: PremiumV2 | Run 3: boosted |
+|---|---|---|---|
+| Tiny | 45.8 ms | 18.0 ms | **17.7 ms** |
+| Small | 42.3 ms | 18.0 ms | **16.3 ms** |
+| Medium | 242 ms | 25.4 ms | **46.3 ms** |
+| Large | 3,187 ms | 716 ms | **559 ms** |
+| Huge | 14,948 ms | 990 ms | **1,495 ms** |
 
-| Bucket | Files | Avg size | Open ms | Write ms | Commit ms | P50 ms | P95 ms | P99 ms | Effective MB/s |
-|---|---|---|---|---|---|---|---|---|---|
-| Tiny | 123,229 | 0.03 MB | 4.70 | 6.57 | 7.75 | 17.96 | 26.60 | 33.20 | **1.7** |
-| Small | 30,795 | 0.53 MB | 5.27 | 6.58 | 9.60 | 18.03 | 32.82 | 93.48 | **24.7** |
-| Medium | 7,323 | 8.39 MB | 56.25 | 30.01 | 112.27 | 25.35 | 920.01 | 1,674 | **42.2** |
-| Large | 671 | 137.35 MB | 193.52 | 169.66 | 579.62 | 716.48 | 2,229 | 3,162 | **145.7** |
-| Huge | 33 | 930.91 MB | 69.75 | 458.37 | 658.07 | 990.44 | 2,245 | 4,746 | **784.7** |
+The Huge bucket holds 28 to 33 files per run. Its numbers move a lot between runs
+for that reason. Do not read the run 2 to run 3 change in that row as a
+regression. The sample is too small.
 
-Two findings hold on both disks.
+The per-file cost breakdown on run 3:
+
+| Bucket | Open ms | Write ms | Commit ms |
+|---|---|---|---|
+| Tiny | 4.64 | 6.44 | 7.77 |
+| Small | 5.13 | 6.56 | 8.83 |
+| Medium | 34.83 | 35.26 | 98.58 |
+| Large | 145.77 | 192.02 | 441.87 |
+| Huge | 529.91 | 556.68 | 931.02 |
+
+Two findings hold on all three disks.
 
 **1. Per-file overhead dominates below about 1 MB.** On the P40 a Tiny file takes
-49 ms end to end. Only 14 ms of that is the write. On PremiumV2 it takes 19 ms,
-and only 6.6 ms is the write. The proportion barely moves. The rest is the
-`PathName()` round trip and the commit. At this size the fixed cost per file is
-the cost.
+49 ms end to end, and only 14 ms of that is the write. On run 3 it takes 19 ms,
+and only 6.4 ms is the write. The proportion barely moves across a 2.8x range of
+disk speed. The rest is the `PathName()` round trip and the commit. At this size
+the fixed cost per file is the cost.
 
-**2. The commit costs more than the write up to about 8 MB.** This holds on both
-disks for Tiny, Small and Medium. `AvgCommitMs` sits at or above `AvgWriteMs`.
-The commit is a durability flush. Below Medium you pay more to flush than to
-write. Batching more files per transaction is the obvious lever. The ingest does
-not support it today, because it uses one transaction per file.
+**2. The commit costs more than the write at every size.** On run 3 `AvgCommitMs`
+sits above `AvgWriteMs` in all five buckets. The commit is a durability flush.
+Batching more files per transaction is the obvious lever. The ingest does not
+support it today, because it uses one transaction per file.
 
 ---
 
-## What the faster disk changed
+## Where the bottleneck sits now
 
 An earlier version of this report said effective throughput never plateaus. It
 concluded that FILESTREAM stays overhead-bound at every size tested. **Run 2
-disproves that.** The large end was disk-bound, not overhead-bound.
+disproved that.** The large end was disk-bound on the P40, not overhead-bound.
 
-| Bucket | P50, P40 | P50, PremiumV2 | MB/s, P40 | MB/s, PremiumV2 | Speedup |
-|---|---|---|---|---|---|
-| Tiny | 45.8 ms | 18.0 ms | 0.7 | **1.7** | 2.4x |
-| Small | 42.3 ms | 18.0 ms | 10.1 | **24.7** | 2.4x |
-| Medium | 242 ms | 25.4 ms | 18.9 | **42.2** | 2.2x |
-| Large | 3,187 ms | 716 ms | 33.6 | **145.7** | 4.3x |
-| Huge | 14,948 ms | 990 ms | 51.1 | **784.7** | **15.4x** |
+Run 3 shows where the limit moved to.
 
-The median for a Huge file fell from 14.9 seconds to 0.99 seconds. The P40
-throttled large writes. FILESTREAM was never the limit there.
+| Step | Sequential disk speed | Ingest throughput | Ingest gain |
+|---|---|---|---|
+| Run 1, P40 | about 250 MB/s | 104.4 MB/s | - |
+| Run 2, PremiumV2 | 476.9 MB/s | 274.5 MB/s | 2.63x |
+| Run 3, boosted | 561.6 MB/s | 296.0 MB/s | 1.08x |
 
-**The important consequence runs the other way.** Faster storage makes the
-small-file penalty worse in relative terms. The spread from Tiny to Huge was 73
-times on the P40. It is now 462 times. Small files are overhead-bound and gained
-only 2.4 times. Large files scale with the hardware and gained 15.4 times.
+Run 1 to run 2 raised the disk by about 1.9 times and the ingest by 2.63 times.
+Run 2 to run 3 raised the disk by 1.18 times and the ingest by 1.08 times. The
+second upgrade returned less than the hardware change that bought it.
 
-This sharpens the main finding of the POC. It does not soften it.
+Perfmon confirms the cause. On run 3 the container disk averaged 21.7 ms write
+latency, and no sample crossed 200 ms. The disk has headroom. The ingest does not
+use it, because it waits on per-file work instead.
+
+**The small end never benefits.** Tiny went 0.7, then 1.7, then 1.8 MB/s. The
+first upgrade helped it a little. The second did not help it at all. The spread
+from Tiny to Huge is now about 300 times.
 
 > If the workload is small files, faster storage does not rescue it. The per-file
 > cost is the `PathName()` round trip plus the commit. Neither is a throughput
-> problem. Storage spend helps the large end almost linearly. It helps the small
-> end barely at all.
+> problem. Storage spend helps the large end. It helps the small end barely at
+> all, and it stops helping anything once the disk clears the workload.
 
 **The A/B against in-table `varbinary(max)` has not run yet.** These numbers
 describe the cost curve of FILESTREAM. They do not tell you whether FILESTREAM is
@@ -179,26 +211,25 @@ the right choice. This is the most important open item. See
 
 ## Where the server-side time went
 
-From `sys.dm_os_wait_stats` deltas over each run:
+From `sys.dm_os_wait_stats` deltas over each run. Total wait time in seconds:
 
-| Wait | P40 time | PremiumV2 time | P40 avg ms | PremiumV2 avg ms |
+| Wait | Run 1 | Run 2 | Run 3 | Run 3 avg ms |
 |---|---|---|---|---|
-| `FILESTREAM_WORKITEM_QUEUE` | 10,063s | 4,110s | 12.53 | 4.94 |
-| `PREEMPTIVE_OS_FILEOPS` | 5,445s | 2,253s | 33.60 | 13.90 |
-| `PREEMPTIVE_OS_CREATEFILE` | 3,785s | 1,753s | 5.85 | 2.70 |
-| `PREEMPTIVE_OS_DELETEFILE` | 625s | 464s | 1.32 | 1.08 |
-| `WRITELOG` | 328s | 197s | 1.95 | 1.21 |
+| `FILESTREAM_WORKITEM_QUEUE` | 10,063 | 4,110 | 3,733 | 4.46 |
+| `PREEMPTIVE_OS_FILEOPS` | 5,445 | 2,253 | 1,911 | 11.77 |
+| `PREEMPTIVE_OS_CREATEFILE` | 3,785 | 1,753 | 1,580 | 2.44 |
+| `PREEMPTIVE_OS_DELETEFILE` | 625 | 464 | 415 | 0.86 |
+| `WRITELOG` | 328 | 197 | 291 | 1.77 |
 
-The `PREEMPTIVE_OS_*` family takes about 43% of wait time on the P40 and about
-45% on PremiumV2. Standard "top waits" scripts filter that family out as idle
-noise. That is why FILESTREAM investigations so often come back empty-handed.
+The `PREEMPTIVE_OS_*` family takes about 43% of wait time on all three runs.
+Standard "top waits" scripts filter that family out as idle noise. That is why
+FILESTREAM investigations so often come back empty-handed.
 
 **Container churn is much higher than the file count suggests.** It is a property
-of FILESTREAM, not of the storage. Run 2 stored 162,051 files and issued 648,204
+of FILESTREAM, not of the storage. Run 3 stored 162,143 files and issued 648,572
 `CREATEFILE` waits. That is about 4 creates per stored file. Run 1 issued 647,336
-waits for 161,832 files. The ratio matches across two different disks. Both
-containers were new and empty, so this is internal churn and not garbage
-collection of earlier runs.
+waits for 161,832 files, and run 2 issued 648,204 for 162,051. The ratio holds
+across three disk configurations.
 
 ---
 
@@ -206,22 +237,50 @@ collection of earlier runs.
 
 Perfmon, `H:` only, over each run:
 
-| Metric | P40 | PremiumV2 |
-|---|---|---|
-| Write latency, average | 170.7 ms | **26.8 ms** |
-| Write latency, maximum | 876.3 ms | **120.1 ms** |
-| Samples over 200 ms | 128 of 393 | **0 of 152** |
-| Queue depth, maximum | 29 | 20 |
-| Throughput, average | 95.2 MB/s | **277.4 MB/s** |
-| Throughput, maximum | 275.3 MB/s | **585.3 MB/s** |
+| Metric | Run 1: P40 | Run 2: PremiumV2 | Run 3: boosted |
+|---|---|---|---|
+| Write latency, average | 170.7 ms | 26.8 ms | **21.7 ms** |
+| Write latency, maximum | 876.3 ms | 120.1 ms | **119.0 ms** |
+| Samples over 200 ms | 128 of 393 | 0 of 152 | **0 of 140** |
+| Queue depth, maximum | 29 | 20 | 24 |
+| Throughput, average | 95.2 MB/s | 277.4 MB/s | **301.7 MB/s** |
+| Throughput, maximum | 275.3 MB/s | 585.3 MB/s | **613.4 MB/s** |
 
 On the P40 the container disk was the bottleneck. A third of all samples sat
-above 200 ms, and throughput pinned at the SKU cap. On PremiumV2 no sample
-crossed 200 ms. The bottleneck moved off the disk and onto per-file overhead.
+above 200 ms, and throughput pinned at the SKU cap. From run 2 onward no sample
+crosses 200 ms.
 
 The two commit timeouts in run 1 fit this picture. Commit latency on the P40
-averaged 1,666 ms for Huge files. The worst single file took 80.8 seconds end to
-end. Run 2 had no timeouts, and its worst single file took 5.9 seconds.
+averaged 1,666 ms for Huge files, and the worst single file took 80.8 seconds end
+to end. Runs 2 and 3 had no timeouts.
+
+---
+
+## Container deletion needs IOPS, not bandwidth
+
+An earlier version of this report carried this as an open question. Run 3 answers
+it.
+
+Dropping the previous 200 GB container takes:
+
+| Disk | Drop time | Deletions per second |
+|---|---|---|
+| Run 1, P40 | 85s | 1,903 |
+| Run 2, PremiumV2 | 555s | 292 |
+| Run 3, PremiumV2 boosted | **29s** | **5,591** |
+
+The run 2 disk had enough bandwidth and not enough IOPS. Bulk container removal
+is almost pure metadata work, so it ran 6.5 times slower than on the P40. Raising
+the IOPS fixed it. Run 3 deletes about 19 times faster than run 2 and about 3
+times faster than the P40.
+
+The earlier candidate explanation was the loss of `ReadOnly` host caching on
+directory metadata reads. That explanation is wrong. Host caching is `None` on
+both run 2 and run 3, and the drop time still fell by 19 times.
+
+**This is the clearest IOPS-bound result in the POC.** Ingest throughput gained
+8% from the same hardware change, and container deletion gained 1,800%. The two
+workloads need different things from the same disk.
 
 ---
 
@@ -231,7 +290,7 @@ end. Run 2 had no timeouts, and its worst single file took 5.9 seconds.
 pool can take everything, which starves the Windows system file cache. This
 matters more for FILESTREAM than for a normal workload. FILESTREAM I/O never uses
 the buffer pool, because the blobs never pass through it. No SQL-side counter
-shows this. The value is capped at 56,000 MB for both valid runs.
+shows this. The value is capped at 56,000 MB for all three valid runs.
 
 **The container disk was the weakest disk on the box. It no longer is.** It was a
 P40 `Premium_LRS` at about 250 MB/s, while `F:` and `G:` were `PremiumV2_LRS`.
@@ -242,27 +301,14 @@ independently, and both default low. A 2048 GB PremiumV2 disk left at the defaul
 125 MB/s is slower than the P40 it replaces. Check the provisioned values before
 you treat a PremiumV2 disk as an upgrade.
 
+**Provision IOPS for the maintenance work, not for the ingest.** The ingest stops
+caring about the disk once it clears about 475 MB/s. Container deletion keeps
+caring well past that point, and it is the longest step in a clean-run cycle when
+IOPS run short.
+
 **Ruled out as factors in these numbers:** Defender (excluded), 8.3 name
 generation (off on `H:`), volume roles (verified against the instance default
 paths), and ReFS (all volumes use NTFS).
-
----
-
-## Open question: container drop time got worse
-
-The drop of the previous 200 GB container took 555 seconds on PremiumV2. The same
-drop took 85 seconds on the P40. The file counts match. That is 292 file
-deletions per second against 1,903, which is 6.5 times worse.
-
-This runs against every other measurement here. In-run
-`PREEMPTIVE_OS_DELETEFILE` waits got faster on PremiumV2, at 1.08 ms average
-against 1.32 ms. Per-file deletes during ingest improved. Bulk container removal
-got much worse.
-
-We have no explanation yet. The loss of `ReadOnly` host caching on directory
-metadata reads is one candidate. Nobody has tested it. This matters in practice.
-A drop sits between every pair of clean runs, and it is now the longest step in
-the cycle.
 
 ---
 
@@ -281,7 +327,9 @@ the cycle.
    but no `/SaveConfig`, and it ignores a hand-written `.pmc` without a message.
    The GUI export in `procmon/README.md` is the only route. Until then we have no
    NTFS-level breakdown of the per-file time.
-5. **The cause of the drop regression above.**
+5. **A batched-commit test.** The commit costs more than the write in every
+   bucket on every disk. The ingest uses one transaction per file, so nobody has
+   measured what batching would return.
 
 ---
 
@@ -295,9 +343,10 @@ sqlcmd -S . -E -b -i sql\99-cleanup.sql -v DbName="FsPocDemo" Mode="drop"
 .\ps\Invoke-PocRun.ps1 -Scenario Filestream -TargetGB 200
 ```
 
-Allow about 10 minutes for the drop on PremiumV2.
+The drop takes about 30 seconds on a disk with enough IOPS. Allow 10 minutes on
+one without.
 
-Early progress looks stalled on both disks. The Tiny and Small buckets hold about
+Early progress looks stalled on every disk. The Tiny and Small buckets hold about
 154,000 files that carry only 20 GB. The progress ETA extrapolates that rate
 across the whole target. Throughput climbs sharply when the run reaches Medium.
 That phase took about 17 minutes on the P40 and about 6 minutes on PremiumV2.
