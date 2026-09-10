@@ -21,7 +21,12 @@
 param(
     [string] $DumpPath,
     [string] $SymbolPath = 'srv*C:\symbols*https://msdl.microsoft.com/download/symbols',
-    [string] $OutputFile
+    [string] $OutputFile,
+    [switch] $InstallDebugger,
+    # Path to an already-downloaded winsdksetup.exe. Installs ONLY the
+    # debuggers -- no other SDK component. winget is not present on Windows
+    # Server by default, so this is the practical route there.
+    [string] $SdkSetupPath
 )
 
 Set-StrictMode -Version Latest
@@ -53,28 +58,88 @@ Write-FsPocLog ("Analysing {0} ({1}, written {2})" -f $dump.FullName, (Format-Fs
 # ---------------------------------------------------------------------------
 # Find a debugger
 # ---------------------------------------------------------------------------
-$debugger = $null
-$searchPaths = @(
-    "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\cdb.exe"
-    "$env:ProgramFiles\Windows Kits\10\Debuggers\x64\cdb.exe"
-    "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\kd.exe"
-    "$env:ProgramFiles\Windows Kits\10\Debuggers\x64\kd.exe"
-)
-foreach ($p in $searchPaths) { if (Test-Path -LiteralPath $p) { $debugger = $p; break } }
-if (-not $debugger) {
+function Find-Debugger {
+    # Fixed SDK locations first -- much the most common.
+    foreach ($p in @(
+        "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\cdb.exe"
+        "$env:ProgramFiles\Windows Kits\10\Debuggers\x64\cdb.exe"
+        "${env:ProgramFiles(x86)}\Windows Kits\10\Debuggers\x64\kd.exe"
+        "$env:ProgramFiles\Windows Kits\10\Debuggers\x64\kd.exe"
+    )) { if (Test-Path -LiteralPath $p) { return $p } }
+
+    # Anything already on PATH.
     $cmd = Get-Command cdb.exe, kd.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($cmd) { $debugger = $cmd.Source }
+    if ($cmd) { return $cmd.Source }
+
+    # The modern WinDbg ships as an MSIX. WindowsApps is ACL-restricted even
+    # for administrators, so this may legitimately find nothing.
+    foreach ($root in @("$env:ProgramFiles\WindowsApps", "$env:LOCALAPPDATA\Microsoft\WindowsApps")) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        $hit = Get-ChildItem -LiteralPath $root -Filter 'cdb.exe' -Recurse -Depth 4 -ErrorAction SilentlyContinue |
+               Select-Object -First 1
+        if ($hit) { return $hit.FullName }
+    }
+
+    # Any other Windows Kits layout.
+    foreach ($root in @("${env:ProgramFiles(x86)}\Windows Kits", "$env:ProgramFiles\Windows Kits")) {
+        if (-not (Test-Path -LiteralPath $root)) { continue }
+        $hit = Get-ChildItem -LiteralPath $root -Filter 'cdb.exe' -Recurse -ErrorAction SilentlyContinue |
+               Select-Object -First 1
+        if ($hit) { return $hit.FullName }
+    }
+    return $null
 }
+
+$debugger = Find-Debugger
+
+if (-not $debugger -and $SdkSetupPath) {
+    if (-not (Test-Path -LiteralPath $SdkSetupPath)) { throw "winsdksetup.exe not found at $SdkSetupPath" }
+    Write-FsPocLog 'Installing ONLY the Debugging Tools from the Windows SDK...' 'STEP'
+    Write-FsPocLog 'No other SDK component is installed. This takes a couple of minutes.' 'INFO'
+    & $SdkSetupPath /features OptionId.WindowsDesktopDebuggers /quiet /norestart | Out-Null
+    Write-FsPocLog 'Re-scanning for a command-line debugger...' 'INFO'
+    $debugger = Find-Debugger
+}
+elseif (-not $debugger -and $InstallDebugger) {
+    if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
+        Write-FsPocLog 'winget is not present. It does not ship with Windows Server -- use -SdkSetupPath instead.' 'WARN'
+    }
+    else {
+        Write-FsPocLog 'Installing the Debugging Tools via winget...' 'STEP'
+        & winget.exe install --id Microsoft.WinDbg --accept-source-agreements --accept-package-agreements --silent
+        $debugger = Find-Debugger
+        if (-not $debugger) {
+            Write-FsPocLog 'winget completed but no cdb.exe/kd.exe appeared. Use -SdkSetupPath instead.' 'WARN'
+        }
+    }
+}
+
 if (-not $debugger) {
     Write-FsPocLog 'No command-line debugger (cdb.exe / kd.exe) found.' 'ERROR'
     Write-Host ''
-    Write-Host '  Install the Debugging Tools for Windows:' -ForegroundColor Yellow
-    Write-Host '      winget install --id Microsoft.WinDbg' -ForegroundColor White
+    Write-Host '  Options, easiest first:' -ForegroundColor Yellow
     Write-Host ''
-    Write-Host '  Or open the dump in WinDbg by hand and run:' -ForegroundColor Yellow
-    Write-Host '      !analyze -v' -ForegroundColor White
+    Write-Host '  1. Install ONLY the debuggers from the Windows SDK. winget does not ship' -ForegroundColor White
+    Write-Host '     with Windows Server, so this is the practical route there. One' -ForegroundColor White
+    Write-Host '     download, one command, no other SDK component installed:' -ForegroundColor White
+    Write-Host '         a) Download winsdksetup.exe from' -ForegroundColor Gray
+    Write-Host '            https://developer.microsoft.com/windows/downloads/windows-sdk' -ForegroundColor Gray
+    Write-Host '         b) .\Get-BugcheckAnalysis.ps1 -SdkSetupPath C:\Temp\winsdksetup.exe' -ForegroundColor Gray
+    Write-Host '            (or run it directly:' -ForegroundColor Gray
+    Write-Host '             winsdksetup.exe /features OptionId.WindowsDesktopDebuggers /quiet /norestart)' -ForegroundColor Gray
     Write-Host ''
-    Write-Host ("  Dump to open: {0}" -f $dump.FullName) -ForegroundColor White
+    Write-Host '  2. On a client OS with winget: re-run with -InstallDebugger.' -ForegroundColor White
+    Write-Host ''
+    Write-Host '  3. Copy the minidump to any machine that already has WinDbg, open it,' -ForegroundColor White
+    Write-Host '     and run !analyze -v. It is under 1 MB and contains no user data' -ForegroundColor White
+    Write-Host '     beyond kernel state:' -ForegroundColor White
+    Write-Host ("         {0}" -f $dump.FullName) -ForegroundColor Gray
+    Write-Host ''
+    Write-Host '  You do NOT need this to make progress. Only two minifilters are' -ForegroundColor Yellow
+    Write-Host '  attached to the FILESTREAM volume, so excluding the container from' -ForegroundColor Yellow
+    Write-Host '  Defender and retrying discriminates between them by itself:' -ForegroundColor Yellow
+    Write-Host '    - crash stops  -> it was the Defender/RsFx interaction' -ForegroundColor Gray
+    Write-Host '    - crash repeats -> RsFx alone; apply the latest CU and open a case' -ForegroundColor Gray
     return
 }
 Write-FsPocLog "Debugger: $debugger" 'OK'
