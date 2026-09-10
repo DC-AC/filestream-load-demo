@@ -348,7 +348,9 @@ foreach ($script in '01-instance-config.sql', '02-create-database.sql', '03-moni
 # ---------------------------------------------------------------------------
 if ($SkipSmokeTest) {
     Write-FsPocLog 'Step 5: smoke test SKIPPED (-SkipSmokeTest).' 'WARN'
-    Write-FsPocLog 'The streaming path is unverified. Run Test-FilestreamPath.ps1 when ready.' 'WARN'
+    Write-Host ''
+    Write-FsPocLog 'Environment built, but the streaming path is UNVERIFIED.' 'WARN'
+    Write-FsPocLog "Verify it with one file:  powershell.exe -ExecutionPolicy Bypass -File $ScriptDir\Test-FilestreamPath.ps1" 'INFO'
     return
 }
 
