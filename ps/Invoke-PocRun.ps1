@@ -29,7 +29,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Filestream', 'Blob', 'FilestreamRead', 'BlobRead')]
+    [ValidateSet('Filestream', 'Blob', 'FileTable', 'FilestreamRead', 'BlobRead', 'FileTableRead')]
     [string] $Scenario = 'Filestream',
 
     [double] $TargetGB,
@@ -41,6 +41,9 @@ param(
     [string] $ConfigPath,
     [string] $SourcePath,
     [switch] $Preallocate,
+    # Force FileTable writes to stable storage, matching what a FILESTREAM
+    # commit does implicitly. Off by default: see Invoke-FilestreamIngest.ps1.
+    [switch] $FileTableFlush,
 
     # Monitoring
     [switch] $Procmon,
@@ -179,8 +182,9 @@ function Invoke-OneRun {
             Threads = $cfg.Threads; ChunkSizeKB = $cfg.ChunkSizeKB
             RunId = $runId; ConfigPath = $ConfigPath
         }
-        if ($SourcePath)  { $ingestArgs.SourcePath = $SourcePath }
-        if ($Preallocate) { $ingestArgs.Preallocate = $true }
+        if ($SourcePath)     { $ingestArgs.SourcePath = $SourcePath }
+        if ($Preallocate)    { $ingestArgs.Preallocate = $true }
+        if ($FileTableFlush) { $ingestArgs.FileTableFlush = $true }
         $result = & (Join-Path $ScriptDir 'Invoke-FilestreamIngest.ps1') @ingestArgs
     }
     finally {
@@ -223,15 +227,23 @@ if ($Matrix) {
     # Straddle the FILESTREAM crossover deliberately: Small is where in-table
     # LOB usually wins, Large is where FILESTREAM usually wins, and Medium is
     # the one nobody can predict without measuring.
+    # Three write paths at each of three sizes, then the read side. Blob and
+    # Filestream are transactional; FileTable is not, so it is expected to win
+    # on raw throughput -- the question the matrix answers is by how much, and
+    # therefore what transactional consistency is costing at each size.
     $matrixPlan = @(
         @{ Scn = 'Blob';           Prof = 'Small'  }
         @{ Scn = 'Filestream';     Prof = 'Small'  }
+        @{ Scn = 'FileTable';      Prof = 'Small'  }
         @{ Scn = 'Blob';           Prof = 'Medium' }
         @{ Scn = 'Filestream';     Prof = 'Medium' }
+        @{ Scn = 'FileTable';      Prof = 'Medium' }
         @{ Scn = 'Blob';           Prof = 'Large'  }
         @{ Scn = 'Filestream';     Prof = 'Large'  }
+        @{ Scn = 'FileTable';      Prof = 'Large'  }
         @{ Scn = 'BlobRead';       Prof = 'Medium' }
         @{ Scn = 'FilestreamRead'; Prof = 'Medium' }
+        @{ Scn = 'FileTableRead';  Prof = 'Medium' }
     )
     Write-FsPocLog "Matrix mode: $($matrixPlan.Count) runs at $($cfg.TargetGB) GB each." 'STEP'
     foreach ($m in $matrixPlan) {

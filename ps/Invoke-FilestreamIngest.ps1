@@ -28,7 +28,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Filestream', 'Blob', 'FilestreamRead', 'BlobRead')]
+    [ValidateSet('Filestream', 'Blob', 'FileTable', 'FilestreamRead', 'BlobRead', 'FileTableRead')]
     [string] $Scenario = 'Filestream',
 
     [double] $TargetGB,
@@ -50,6 +50,15 @@ param(
     # Preallocate the FILESTREAM file to its final size on open. Real tuning
     # knob: it trades an up-front NTFS allocation for fewer extend operations.
     [switch] $Preallocate,
+
+    <#  FileTable writes are non-transacted Win32 I/O over the SMB share, so
+        unlike a FILESTREAM commit nothing forces them to disk. Left off, this
+        measures FileTable as applications actually use it; switched on, it
+        forces each file to stable storage so the comparison against a
+        FILESTREAM commit is like for like. The two answer different questions
+        and the analysis reports which was used.
+    #>
+    [switch] $FileTableFlush,
 
     # Skip writing run metadata / snapshots to FsPocMonitor (raw throughput only).
     [switch] $NoMonitorDb,
@@ -119,9 +128,33 @@ if ($SourcePath) {
     Write-FsPocLog ("Found {0:N0} files, {1}" -f $sourceFiles.Count, (Format-FsPocBytes $srcBytes)) 'OK'
 }
 
-# Read scenarios need the FileId range to sample from.
+# --- FileTable: resolve the share root, or the file list for a read run ----
+$fileTableRoot  = ''
+$fileTablePaths = @()
+
+if ($Scenario -eq 'FileTable') {
+    $ft = Invoke-FsPocSql -Instance $cfg.SqlInstance -Database $cfg.DemoDb -Query 'EXEC dbo.usp_GetFileTableRoot'
+    if ($ft.Rows.Count -eq 0 -or $ft.Rows[0].RootPath -is [DBNull]) {
+        throw "FileTableRootPath() returned NULL. The database needs NON_TRANSACTED_ACCESS = FULL and a DIRECTORY_NAME, and the instance needs FILESTREAM level 2 or higher. Re-run sql\02-create-database.sql."
+    }
+    $fileTableRoot = [string]$ft.Rows[0].RootPath
+    Write-FsPocLog "FileTable share root: $fileTableRoot" 'OK'
+    if (-not (Test-Path -LiteralPath $fileTableRoot)) {
+        throw "The FileTable share root is not reachable from this client: $fileTableRoot"
+    }
+}
+elseif ($Scenario -eq 'FileTableRead') {
+    $ftp = Invoke-FsPocSql -Instance $cfg.SqlInstance -Database $cfg.DemoDb `
+             -Query 'EXEC dbo.usp_GetFileTableSample @Top' -Parameters @{ Top = 500000 }
+    $fileTablePaths = @($ftp.Rows | ForEach-Object {
+        [pscustomobject]@{ FullPath = [string]$_.FullPath; SizeBytes = [long]$_.SizeBytes } })
+    if ($fileTablePaths.Count -eq 0) { throw 'The FileTable holds no files. Run a FileTable ingest first.' }
+    Write-FsPocLog ("FileTable read source: {0:N0} file(s)" -f $fileTablePaths.Count) 'OK'
+}
+
+# Read scenarios over FileStore/BlobStore need the FileId range to sample from.
 $readRange = $null
-if ($isRead) {
+if ($isRead -and $Scenario -ne 'FileTableRead') {
     $tbl = if ($Scenario -eq 'BlobRead') { 'BlobStore' } else { 'FileStore' }
     $srcRun = if ($PSBoundParameters.ContainsKey('SourceRunId')) { $SourceRunId } else { $null }
     $rr = Invoke-FsPocSql -Instance $cfg.SqlInstance -Database $cfg.DemoDb `
@@ -183,7 +216,10 @@ $worker = {
         [bool]     $Preallocate,
         [object[]] $SourceFiles,
         [object]   $ReadRange,
-        [long]     $ReadOpCount
+        [long]     $ReadOpCount,
+        [string]   $FileTableRoot,
+        [bool]     $FileTableFlush,
+        [object[]] $FileTablePaths
     )
 
     $ErrorActionPreference = 'Stop'
@@ -212,6 +248,9 @@ $worker = {
     # from the shared pool with an offset and needs no copy).
     $chunkBuf = New-Object byte[] $ChunkBytes
     $seq = [long]0
+    # FileTable directories are rows too: creating one is a write. Track which
+    # this worker has already made so it is done once, not once per file.
+    $createdDirs = New-Object 'System.Collections.Generic.HashSet[string]'
 
     try {
         # -------------------------------------------------------------------
@@ -219,7 +258,14 @@ $worker = {
         # -------------------------------------------------------------------
         $items = New-Object System.Collections.Generic.List[object]
 
-        if ($Scenario -like '*Read') {
+        if ($Scenario -eq 'FileTableRead') {
+            # Stripe the real path list across workers.
+            for ($i = $WorkerId; $i -lt $FileTablePaths.Count; $i += $Control['Threads']) {
+                $f = $FileTablePaths[$i]
+                $items.Add([pscustomobject]@{ Bucket = 'read'; FileId = [long]0; SizeBytes = [long]$f.SizeBytes; Path = [string]$f.FullPath })
+            }
+        }
+        elseif ($Scenario -like '*Read') {
             $span = [long]($ReadRange.MaxFileId - $ReadRange.MinFileId + 1)
             for ($i = 0; $i -lt $ReadOpCount; $i++) {
                 $fid = $ReadRange.MinFileId + [long]($rand.NextDouble() * $span)
@@ -390,6 +436,74 @@ $worker = {
                         $me['Bytes'] += $size
                     }
 
+                    # ---------------- FILETABLE WRITE -----------------------
+                    # Ordinary Win32 file I/O over the SMB share. No SQL
+                    # connection is touched: SQL Server surfaces the file as a
+                    # row on its own. That is the entire point of the
+                    # comparison, so there is deliberately no transaction and
+                    # no commit phase here.
+                    'FileTable' {
+                        $size = $item.SizeBytes
+                        $dir  = Join-Path (Join-Path $FileTableRoot "w$WorkerId") $item.Bucket
+                        if (-not $createdDirs.Contains($dir)) {
+                            $stage = 'FileTable create directory'
+                            $null = [System.IO.Directory]::CreateDirectory($dir)
+                            $null = $createdDirs.Add($dir)
+                        }
+                        $path = Join-Path $dir ([guid]::NewGuid().ToString('N') + '.bin')
+
+                        $sw.Restart()
+                        $stage = 'FileTable create file'
+                        $fs = [System.IO.File]::Create($path, $ChunkBytes, [System.IO.FileOptions]::SequentialScan)
+                        $sw.Stop(); $openMs = $sw.Elapsed.TotalMilliseconds
+
+                        $sw.Restart()
+                        try {
+                            $stage = 'FileTable write'
+                            $remaining = $size
+                            while ($remaining -gt 0) {
+                                $n   = [int][Math]::Min([long]$ChunkBytes, $remaining)
+                                $off = $rand.Next(0, $Pool.Length - $n)
+                                $fs.Write($Pool, $off, $n)
+                                $remaining -= $n
+                            }
+                            # Flush(true) forces the file to stable storage,
+                            # which is what a FILESTREAM commit does implicitly.
+                            if ($FileTableFlush) { $fs.Flush($true) }
+                        }
+                        finally { $fs.Close(); $fs.Dispose() }
+                        $sw.Stop(); $writeMs = $sw.Elapsed.TotalMilliseconds
+
+                        # commitMs stays 0: there is no transaction to commit.
+                        $me['Bytes'] += $size
+                    }
+
+                    # ---------------- FILETABLE READ ------------------------
+                    'FileTableRead' {
+                        $sw.Restart()
+                        $stage = 'FileTable open for read'
+                        $fs = [System.IO.File]::Open($item.Path, [System.IO.FileMode]::Open,
+                                                     [System.IO.FileAccess]::Read,
+                                                     [System.IO.FileShare]::Read)
+                        $sw.Stop(); $openMs = $sw.Elapsed.TotalMilliseconds
+
+                        $sw.Restart()
+                        $read = [long]0
+                        try {
+                            $stage = 'FileTable read'
+                            while (($n = $fs.Read($chunkBuf, 0, $chunkBuf.Length)) -gt 0) { $read += $n }
+                        }
+                        finally { $fs.Close(); $fs.Dispose() }
+                        $sw.Stop(); $writeMs = $sw.Elapsed.TotalMilliseconds
+
+                        if ($item.SizeBytes -gt 0 -and $read -ne $item.SizeBytes) {
+                            $me['Errors']++
+                            $me['LastError'] = "Short read on $($item.Path): $read of $($item.SizeBytes)"
+                        }
+                        $item.SizeBytes = $read
+                        $me['Bytes'] += $read
+                    }
+
                     # ---------------- FILESTREAM READ -----------------------
                     'FilestreamRead' {
                         $sw.Restart()
@@ -543,7 +657,10 @@ foreach ($w in 0..($cfg.Threads - 1)) {
         AddArgument([bool]$Preallocate).
         AddArgument($sourceFiles).
         AddArgument($readRange).
-        AddArgument([long]$readOpsPerWorker)
+        AddArgument([long]$readOpsPerWorker).
+        AddArgument([string]$fileTableRoot).
+        AddArgument([bool]$FileTableFlush).
+        AddArgument($fileTablePaths)
     $jobs += [pscustomobject]@{ Id = $w; Shell = $ps; Handle = $ps.BeginInvoke() }
 }
 

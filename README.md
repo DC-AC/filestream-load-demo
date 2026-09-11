@@ -160,6 +160,39 @@ To ingest real files instead: `-SourcePath D:\RealFiles`.
 
 ---
 
+## The three write paths
+
+The kit measures the same synthetic workload down three different paths, which
+is what makes the result a decision rather than a number.
+
+| Path | How it writes | Transactional | Recovered/backed up with the DB |
+|---|---|---|---|
+| `Filestream` | `SqlFileStream`, Win32 streaming inside a SQL transaction | yes | yes |
+| `Blob` | chunked `varbinary(max)` `.WRITE` appends over TDS | yes | yes |
+| `FileTable` | ordinary Win32 file I/O over the SMB share | **no** | yes |
+
+`FileTable` is the odd one out and the reason it is worth including. The client
+never touches a SQL connection during the write — it creates a file on the
+share and SQL Server surfaces it as a row. There is no transaction and no
+commit flush, so it is normally the fastest of the three. The useful question
+is not *which is fastest* but **how much throughput transactional consistency
+is costing you at each file size**, which is exactly what the matrix reports.
+
+Two things to keep honest when reading those numbers:
+
+- A FILESTREAM commit forces the file to stable storage. A FileTable write is
+  buffered by Windows like any other file write. `-FileTableFlush` calls
+  `Flush(true)` per file so the comparison is like for like; without it you are
+  comparing durable writes against buffered ones. The analysis says which was
+  used.
+- FileTable's schema is fixed, so there is nowhere to record `RunId` or a size
+  bucket on the row. Per-bucket detail for FileTable runs comes from the
+  client-side timings in `FsPocMonitor.dbo.IngestTiming`, which are captured
+  identically for every path.
+
+Read scenarios exist for all three: `FilestreamRead`, `BlobRead`,
+`FileTableRead`. Ingest performance alone is half an answer.
+
 ## What gets measured
 
 **Client-side per-file timings** — `open` / `write` / `commit` split for every

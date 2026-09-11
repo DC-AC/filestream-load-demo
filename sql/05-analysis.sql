@@ -211,9 +211,26 @@ GROUP BY Bucket WITH ROLLUP
 ORDER BY Bucket;';
 EXEC sys.sp_executesql @sql;
 
-/* ================= 8. A/B: FILESTREAM vs IN-TABLE LOB =================== */
+/* ==================== 7b. FILETABLE CONTENTS ============================ */
 PRINT '';
-PRINT '--- 8. A/B comparison across runs (same profile, both scenarios) ----';
+PRINT '--- 7b. FileTable contents (non-transacted share path) --------------';
+PRINT '    FileTable has a fixed schema with nowhere to record RunId, so this';
+PRINT '    is the whole table rather than one run. Per-bucket and per-run';
+PRINT '    detail for FileTable comes from the client timings in section 5.';
+SET @sql = N'
+USE [' + (SELECT TargetDb FROM dbo.PocRun WHERE RunId = @RunId) + N'];
+IF OBJECT_ID(''dbo.FileStoreFT'') IS NULL
+    SELECT FileTable = ''dbo.FileStoreFT does not exist -- run sql\02-create-database.sql'';
+ELSE
+    EXEC dbo.usp_GetFileTableSummary;';
+EXEC sys.sp_executesql @sql;
+
+/* ================= 8. A/B: WRITE PATHS COMPARED ======================== */
+PRINT '';
+PRINT '--- 8. Comparison across runs and write paths -----------------------';
+PRINT '    Filestream and Blob are transactional; FileTable is not, so it has';
+PRINT '    no commit to pay for. Read the gap as the cost of that guarantee,';
+PRINT '    not as a like-for-like win, unless the run used -FileTableFlush.';
 SELECT
     r.Scenario,
     r.SizeProfile,

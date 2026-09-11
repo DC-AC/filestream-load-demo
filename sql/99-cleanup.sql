@@ -47,6 +47,13 @@ BEGIN
     USE [$(DbName)];
     DELETE FROM dbo.FileStore;
     DELETE FROM dbo.BlobStore;
+    -- FileTable rows are files. Deleting the rows deletes them from the share;
+    -- directories must go after their contents, hence the ordering.
+    IF OBJECT_ID(''dbo.FileStoreFT'') IS NOT NULL
+    BEGIN
+        DELETE FROM dbo.FileStoreFT WHERE is_directory = 0;
+        DELETE FROM dbo.FileStoreFT WHERE is_directory = 1;
+    END
     CHECKPOINT;';
     EXEC sys.sp_executesql @sql;
 

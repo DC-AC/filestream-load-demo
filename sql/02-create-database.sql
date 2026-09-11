@@ -299,3 +299,103 @@ BEGIN
         FROM dbo.FileStore WHERE (@RunId IS NULL OR RunId = @RunId);
 END
 GO
+
+/* ---------------------------------------------------------------------------
+   FileTable: the third test path.
+
+   FILESTREAM with SqlFileStream and FileTable sit at opposite ends of a real
+   trade-off, and the POC is more useful for containing both:
+
+     FILESTREAM + SqlFileStream   transacted. The write joins the database
+                                  transaction, commits atomically with the row,
+                                  and is covered by backup and recovery. Costs a
+                                  transaction and a durability flush per file.
+
+     FileTable                    non-transacted. Files are written with
+                                  ordinary Win32 I/O over the SMB share and
+                                  SQL Server surfaces them as rows. No
+                                  transaction, no commit flush -- and no
+                                  atomicity with any row you write alongside.
+
+   The second is usually faster per file. The interesting question is by how
+   much, on this storage, at each size -- and whether that margin is worth
+   giving up transactional consistency for. That is a decision the numbers
+   inform rather than make.
+
+   Requires NON_TRANSACTED_ACCESS = FULL and a DIRECTORY_NAME on the database,
+   both set when it was created.
+--------------------------------------------------------------------------- */
+USE [$(DbName)];
+GO
+
+IF OBJECT_ID('dbo.FileStoreFT') IS NULL
+BEGIN
+    EXEC(N'
+    CREATE TABLE dbo.FileStoreFT AS FileTable
+    WITH (
+        FileTable_Directory = ''FileStoreFT'',
+        FileTable_Collate_Filename = database_default
+    );');
+    PRINT 'Created FileTable dbo.FileStoreFT';
+END
+ELSE
+    PRINT 'FileTable dbo.FileStoreFT already exists';
+GO
+
+/* The share path the client writes to. Returns something of the form
+   \\<server>\<instance share>\<database directory>\FileStoreFT */
+CREATE OR ALTER PROCEDURE dbo.usp_GetFileTableRoot
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT
+        RootPath     = FileTableRootPath(N'dbo.FileStoreFT'),
+        DatabaseRoot = FileTableRootPath(),
+        ShareEnabled = CONVERT(int, SERVERPROPERTY('FilestreamEffectiveLevel'));
+END
+GO
+
+/* Sample of real file paths for the read benchmark. GetFileNamespacePath(1)
+   returns the full UNC path rather than a database-relative one. */
+CREATE OR ALTER PROCEDURE dbo.usp_GetFileTableSample
+    @Top int = 100000
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT TOP (@Top)
+        FullPath  = file_stream.GetFileNamespacePath(1),
+        SizeBytes = CONVERT(bigint, DATALENGTH(file_stream))
+    FROM dbo.FileStoreFT
+    WHERE is_directory = 0
+      AND DATALENGTH(file_stream) > 0
+    ORDER BY creation_time DESC;
+END
+GO
+
+/* Row-level view of what landed, for the analysis report. FileTable's schema is
+   fixed, so there is nowhere to record RunId or a size bucket -- per-bucket
+   detail for FileTable runs comes from the client-side timings in
+   FsPocMonitor.dbo.IngestTiming instead. */
+CREATE OR ALTER PROCEDURE dbo.usp_GetFileTableSummary
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT
+        Files      = COUNT_BIG(*),
+        TotalGB    = CONVERT(decimal(18,2), SUM(CONVERT(bigint, DATALENGTH(file_stream))) / 1073741824.0),
+        MinMB      = CONVERT(decimal(18,3), MIN(CONVERT(bigint, DATALENGTH(file_stream))) / 1048576.0),
+        AvgMB      = CONVERT(decimal(18,3), AVG(CONVERT(bigint, DATALENGTH(file_stream)) * 1.0) / 1048576.0),
+        MaxMB      = CONVERT(decimal(18,3), MAX(CONVERT(bigint, DATALENGTH(file_stream))) / 1048576.0),
+        Directories= (SELECT COUNT_BIG(*) FROM dbo.FileStoreFT WHERE is_directory = 1),
+        FirstAt    = MIN(creation_time),
+        LastAt     = MAX(creation_time)
+    FROM dbo.FileStoreFT
+    WHERE is_directory = 0;
+END
+GO
+
+PRINT '';
+PRINT 'FileTable share root:';
+GO
+EXEC dbo.usp_GetFileTableRoot;
+GO
