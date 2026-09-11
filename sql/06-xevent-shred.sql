@@ -32,7 +32,13 @@ SELECT CONVERT(xml, event_data) AS ed, file_name, file_offset
 INTO #xe
 FROM sys.fn_xe_file_target_read_file(N'$(XePath)\$(SessionName)*.xel', NULL, NULL, NULL);
 
-PRINT 'Events read: ' + CONVERT(varchar(20), (SELECT COUNT(*) FROM #xe));
+-- The count goes through a variable rather than inline in the PRINT. PRINT
+-- takes a scalar expression, and a subquery there is a COMPILE error ("Subqueries
+-- are not allowed in this context") -- which fails the whole batch, so the
+-- SELECT ... INTO #xe above never runs either and the shred produces nothing.
+DECLARE @Events bigint;
+SELECT @Events = COUNT_BIG(*) FROM #xe;
+PRINT 'Events read: ' + CONVERT(varchar(20), @Events);
 GO
 
 IF OBJECT_ID('tempdb..#ev') IS NOT NULL DROP TABLE #ev;
@@ -130,12 +136,28 @@ ORDER BY EventTime;
 PRINT '';
 PRINT '--- Per-second wait pressure (for charting against Procmon) --------';
 SELECT
-    Second   = DATEADD(second, DATEDIFF(second, 0, EventTime), 0),
+    Second,
     WaitType,
     Events   = COUNT(*),
     TotalMs  = SUM(RawDuration)
-FROM #ev
-WHERE EventName IN ('wait_info','wait_info_external')
-GROUP BY DATEADD(second, DATEDIFF(second, 0, EventTime), 0), WaitType
+FROM (
+    SELECT
+        WaitType, RawDuration,
+        /*  Truncate to the second, anchored on the event's OWN date so the
+            DATEDIFF stays under 86,400.
+
+            The obvious DATEADD(second, DATEDIFF(second, 0, EventTime), 0) counts
+            seconds from 1900-01-01, which for a 2026 timestamp is about 4.0e9 --
+            past the int limit of 2,147,483,647. That raises "The datediff
+            function resulted in an overflow" and takes down this whole section,
+            which is the last one in the file, so the shred appears to work right
+            up until it doesn't.  */
+        Second = DATEADD(second,
+                         DATEDIFF(second, CONVERT(datetime2(3), CONVERT(date, EventTime)), EventTime),
+                         CONVERT(datetime2(3), CONVERT(date, EventTime)))
+    FROM #ev
+    WHERE EventName IN ('wait_info','wait_info_external')
+) x
+GROUP BY Second, WaitType
 ORDER BY Second, TotalMs DESC;
 GO

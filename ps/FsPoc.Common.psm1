@@ -37,6 +37,28 @@ function Get-FsPocConfig {
     foreach ($k in $Override.Keys) {
         if ($null -ne $Override[$k] -and $Override[$k] -ne '') { $cfg[$k] = $Override[$k] }
     }
+
+    <#  Procmon: fall back to PATH when the configured path does not exist.
+
+        The config ships a guessed path (C:\Tools\Procmon\Procmon64.exe). If
+        Procmon was installed anywhere on PATH instead -- Sysinternals Suite in
+        System32 is common -- the old behaviour was to Test-Path the guess, warn
+        "Procmon not found", and skip. That turns an explicit -Procmon into a
+        silent no-op: the run completes, ProcmonActive is still set, and the
+        per-file NTFS anatomy the switch was asked for is simply absent.
+
+        Resolving here rather than at the four call sites keeps Start- and
+        Stop-PocCapture using $cfg.ProcmonExe unchanged. A genuinely absent
+        Procmon still leaves the configured value in place, so the existing
+        warning in Start-PocCapture.ps1 still fires and still names the path.
+    #>
+    $configured = [string]$cfg['ProcmonExe']
+    if ([string]::IsNullOrWhiteSpace($configured) -or -not (Test-Path -LiteralPath $configured)) {
+        $onPath = Get-Command 'Procmon64.exe', 'Procmon.exe' -CommandType Application -ErrorAction SilentlyContinue |
+                  Select-Object -First 1
+        if ($onPath) { $cfg['ProcmonExe'] = $onPath.Source }
+    }
+
     [pscustomobject]$cfg
 }
 

@@ -1,36 +1,40 @@
 # SQL Server FILESTREAM performance POC kit
 
-Generates and ingests a few hundred GB into a FILESTREAM database on an Azure
-SQL Server VM, with wait-stat, Extended Events, Perfmon and Process Monitor
-instrumentation around it, plus an A/B baseline against plain in-table
-`varbinary(max)`.
+This kit generates and ingests a few hundred GB into a FILESTREAM database on an
+Azure SQL Server VM. It puts wait-stat, Extended Events, Perfmon and Process
+Monitor instrumentation around the load. It measures the same workload down
+three write paths — transacted `SqlFileStream`, in-table `varbinary(max)`, and
+non-transacted FileTable over the SMB share — so the result informs a decision
+rather than reporting a single number.
 
 ---
 
-## Constraints — read these first
+## Constraints. Read these first
 
-**Run everything on the SQL Server VM itself, under Windows PowerShell 5.1.**
+**Run everything on the SQL Server VM. Use Windows PowerShell 5.1.**
 
-The ingest engine writes through `System.Data.SqlTypes.SqlFileStream`, the
-managed wrapper over the Win32 FILESTREAM streaming API. That type exists in
-.NET Framework and was **never ported to .NET Core / .NET 5+** —
-`Microsoft.Data.SqlClient` does not include it. Under PowerShell 7 the scripts
-fail with a type-not-found error, and the only fallback is the T-SQL path, which
-is the thing you are trying to measure *against*. `Invoke-FilestreamIngest.ps1`
-checks `$PSVersionTable` and refuses to start rather than silently measuring the
-wrong thing.
+The ingest engine writes through `System.Data.SqlTypes.SqlFileStream`. This type
+is the managed wrapper over the Win32 FILESTREAM streaming API. It exists in
+.NET Framework only. Microsoft never ported it to .NET Core or .NET 5+, and
+`Microsoft.Data.SqlClient` does not include it.
+
+Under PowerShell 7 the scripts fail with a type-not-found error. The only
+fallback is the T-SQL path, which is the thing you want to measure against.
+`Invoke-FilestreamIngest.ps1` checks `$PSVersionTable` and refuses to start.
+This stops the kit from measuring the wrong thing.
 
 ```powershell
 powershell.exe -ExecutionPolicy Bypass -File .\ps\Invoke-PocRun.ps1
 ```
 
-**Windows authentication is required.** `PathName()` gives the client a UNC path
-into the FILESTREAM share, and the client opens it with `CreateFile` under its
-own Windows token. SQL authentication gets you a valid path and then an
-access-denied. The connection strings in the kit use `Integrated Security=SSPI`.
+**You must use Windows authentication.** `PathName()` gives the client a UNC
+path into the FILESTREAM share. The client opens that path with `CreateFile`
+under its own Windows token. SQL authentication gives you a valid path and then
+an access-denied error. The connection strings in the kit use
+`Integrated Security=SSPI`.
 
-**FILESTREAM access level must be 2 or higher** (3 if you ever run the client
-off-box). Level 1 is T-SQL only and the Win32 open is refused.
+**Set the FILESTREAM access level to 2 or higher.** Use level 3 if you ever run
+the client off the VM. Level 1 is T-SQL only, and the Win32 open fails.
 
 ---
 
@@ -39,7 +43,8 @@ off-box). Level 1 is T-SQL only and the Win32 open is refused.
 ```
 sql/
   01-instance-config.sql     FILESTREAM access level, instance checks
-  02-create-database.sql     Demo DB, FILESTREAM filegroup, FileStore + BlobStore, procs
+  02-create-database.sql     Demo DB, FILESTREAM filegroup, FileStore + BlobStore
+                             + FileStoreFT (FileTable), procs
   03-monitor-db.sql          FsPocMonitor: run metadata, snapshots, sampler, analysis views
   04-xevents.sql             FsPoc_Waits event session
   05-analysis.sql            Post-run report
@@ -72,37 +77,39 @@ procmon/README.md            Procmon column/filter setup (one-time, manual)
 
 ## Quick start
 
-1. Copy the whole folder to the VM, e.g. `C:\FsPoc`.
+1. Copy the whole folder to the VM. Use `C:\FsPoc`, for example.
 
-2. Edit `ps\FsPocConfig.psd1`. At minimum set `SqlInstance` and the four paths.
-   **Put `FsPath`, `LogPath` and `ResultsPath` on separate disks** — see the
-   Azure notes below.
+2. Edit `ps\FsPocConfig.psd1`. Set `SqlInstance` and the four paths. **Put
+   `FsPath`, `LogPath` and `ResultsPath` on separate disks.** See the Azure
+   notes below.
 
 3. **Check the volume roles.** `DataPath`, `LogPath` and `FsPath` must point at
-   the volumes you actually intend. Putting the FILESTREAM container on the log
-   disk produces a result that measures the wrong device, and nothing downstream
-   will complain. Setup cross-checks each path against the instance's own
-   `InstanceDefaultDataPath` and `InstanceDefaultLogPath` — SQL Server's
-   configured defaults are the authoritative statement of which volume is for
-   what, where a volume label is free text that may be stale or blank — and
-   refuses to continue on a mismatch (`-IgnoreVolumeRoles` overrides it when
-   the layout is deliberate).
+   the volumes you intend.
 
-4. One-time setup, elevated:
+   A FILESTREAM container on the log disk measures the wrong device, and nothing
+   downstream reports the mistake. Setup cross-checks each path against the
+   instance's own `InstanceDefaultDataPath` and `InstanceDefaultLogPath`. SQL
+   Server's configured defaults are the authoritative statement of which volume
+   holds what. A volume label is free text that can be stale or blank. Setup
+   refuses to continue on a mismatch. Use `-IgnoreVolumeRoles` when the layout
+   is deliberate.
+
+4. Run the one-time setup from an elevated prompt:
 
    ```powershell
    powershell.exe -ExecutionPolicy Bypass -File .\ps\Setup-FilestreamPoc.ps1 -RestartSqlService -ApplyNtfsTuning
    ```
 
-   This enables Windows-level FILESTREAM via WMI, restarts SQL Server, creates
-   the directories, checks the volumes, runs the SQL scripts, and finishes with
-   a 50 MB smoke test through the real `SqlFileStream` path. If the smoke test
-   fails, nothing else in the kit will work — it prints the four usual causes.
+   This step enables Windows-level FILESTREAM through WMI. It restarts SQL
+   Server, creates the directories and checks the volumes. It runs the SQL
+   scripts. It ends with a 50 MB smoke test through the real `SqlFileStream`
+   path. If the smoke test fails, nothing else in the kit works. The script
+   prints the four usual causes.
 
-5. Set up Procmon once, following [`procmon/README.md`](procmon/README.md).
-   The Duration column is off by default and you need it.
+5. Set up Procmon once. Follow [`procmon/README.md`](procmon/README.md). The
+   Duration column is off by default, and you need it.
 
-6. Run:
+6. Run the load:
 
    ```powershell
    # The headline number: 200 GB, clean, no tracing overhead
@@ -118,45 +125,46 @@ procmon/README.md            Procmon column/filter setup (one-time, manual)
 
 ---
 
-## What gets generated
+## What the kit generates
 
-200 GB is synthesised in memory from a 256 MB pool of cryptographic random
-bytes, written at random offsets. Nothing is staged to disk first, so a 200 GB
-run needs 200 GB of destination capacity, not 400 GB. The random-offset scheme
-keeps the data incompressible, which matters: NTFS compression, Azure host-level
-dedup and any storage-side compression would otherwise inflate your throughput
-into a number that will not survive production.
+The kit builds 200 GB in memory from a 256 MB pool of cryptographic random
+bytes. It writes those bytes at random offsets. Nothing goes to disk first, so a
+200 GB run needs 200 GB of destination capacity, not 400 GB.
+
+The random-offset scheme keeps the data incompressible. This matters. NTFS
+compression, Azure host-level dedup and any storage-side compression inflate
+your throughput. An inflated number does not survive production.
 
 Default `Mixed` profile at 200 GB:
 
 | Bucket | Size range      | Share of bytes | Files   |
 |--------|-----------------|----------------|---------|
-| Tiny   | 4 KB – 64 KB    | 2%             | ~123,000 |
-| Small  | 64 KB – 1 MB    | 8%             | ~31,000  |
-| Medium | 1 MB – 16 MB    | 30%            | ~7,200   |
-| Large  | 16 MB – 256 MB  | 45%            | ~680     |
-| Huge   | 256 MB – 2000 MB| 15%            | ~28      |
+| Tiny   | 4 KB - 64 KB    | 2%             | ~123,000 |
+| Small  | 64 KB - 1 MB    | 8%             | ~31,000  |
+| Medium | 1 MB - 16 MB    | 30%            | ~7,200   |
+| Large  | 16 MB - 256 MB  | 45%            | ~680     |
+| Huge   | 256 MB - 2000 MB| 15%            | ~28      |
 |        |                 |                | **~162,000** |
 
-Shares are of *bytes*, not file count, which is why the small buckets produce
-enormous file counts. That is deliberate. FILESTREAM's cost is per-file, not
-per-byte: NTFS directory pressure and per-file transaction overhead are the two
-things a naive "write 200 GB in 200 files" test misses entirely, and they are
-usually what decides the answer.
+The shares are shares of *bytes*, not of file count. This is why the small
+buckets produce very high file counts. The kit does this on purpose.
 
-Ranges straddle the crossover on purpose. The long-standing guidance is that
-FILESTREAM tends to win above ~1 MB and lose below ~256 KB, with the middle
-depending entirely on your storage — which is the reason to run a POC at all.
-`05-analysis.sql` reports every bucket separately so you get a crossover point
-for *your* VM rather than a single blended number that hides it.
+FILESTREAM's cost is per file, not per byte. NTFS directory pressure and
+per-file transaction overhead usually decide the answer. A naive test that
+writes 200 GB in 200 files misses both.
 
-The `Huge` bucket stops just under 2000 MB deliberately. `varbinary(max)` caps
-at 2 GB per value; FILESTREAM has no such limit. Keeping both under the ceiling
-lets the identical profile run down both paths — and that ceiling is itself
-worth writing into the POC findings, because it is a hard functional difference
-rather than a performance one.
+The ranges cross the crossover point on purpose. The long-standing guidance says
+that FILESTREAM tends to win above about 1 MB and to lose below about 256 KB.
+Your storage decides the middle, which is the reason to run a POC.
+`05-analysis.sql` reports every bucket separately. You get a crossover point for
+*your* VM instead of one blended number that hides it.
 
-To ingest real files instead: `-SourcePath D:\RealFiles`.
+The `Huge` bucket stops just below 2000 MB on purpose. `varbinary(max)` holds at
+most 2 GB per value, and FILESTREAM has no such limit. Both paths can run the
+same profile below that ceiling. Write the ceiling into the POC findings: it is
+a hard functional difference, not a performance one.
+
+To ingest real files instead, use `-SourcePath D:\RealFiles`.
 
 ---
 
@@ -193,120 +201,127 @@ Two things to keep honest when reading those numbers:
 Read scenarios exist for all three: `FilestreamRead`, `BlobRead`,
 `FileTableRead`. Ingest performance alone is half an answer.
 
-## What gets measured
+## What the kit measures
 
-**Client-side per-file timings** — `open` / `write` / `commit` split for every
-single file, written to per-worker CSVs and bulk-loaded into
-`FsPocMonitor.dbo.IngestTiming`. This is the only source of per-operation
-latency for the streaming path, because those writes never pass through SQL
-Server's I/O stack at all: the client writes to NTFS directly. `sys.dm_io_virtual_file_stats`
-cannot see them, and neither can any DMV.
+**Client-side per-file timings.** The kit records an `open`, `write` and
+`commit` split for every file. It writes the split to per-worker CSVs and
+bulk-loads it into `FsPocMonitor.dbo.IngestTiming`.
 
-**Wait statistics** — full `sys.dm_os_wait_stats` snapshots either side of the
-run, delta'd in `vw_WaitDelta`. Section 3 of the analysis reports FILESTREAM and
-Win32 waits *unfiltered*, including ones normally dismissed as idle noise:
+This is the only source of per-operation latency for the streaming path. Those
+writes never pass through SQL Server's I/O stack, because the client writes to
+NTFS directly. `sys.dm_io_virtual_file_stats` cannot see them, and no other DMV
+can see them either.
+
+**Wait statistics.** The kit takes full `sys.dm_os_wait_stats` snapshots on both
+sides of the run and deltas them in `vw_WaitDelta`. Section 3 of the analysis
+reports FILESTREAM and Win32 waits *unfiltered*. It includes the waits that
+people normally dismiss as idle noise:
 
 | Wait | What it means here |
 |------|--------------------|
-| `FSAGENT` | FILESTREAM agent throttle — contention on the FS agent |
+| `FSAGENT` | FILESTREAM agent throttle. Contention on the FS agent |
 | `FS_FC_RWLOCK` | Garbage collector / file control lock |
 | `FS_HEADER_RWLOCK` | Container metadata contention |
 | `FSA_FORCE_OWN_XACT` | Transaction ownership handoff on Win32 open |
 | `PREEMPTIVE_OS_WRITEFILE` | Raw NTFS write cost |
-| `PREEMPTIVE_OS_CREATEFILE` | New container file — NTFS metadata cost |
+| `PREEMPTIVE_OS_CREATEFILE` | New container file. NTFS metadata cost |
 | `PREEMPTIVE_OS_FLUSHFILEBUFFERS` | Durability flush |
 | `PREEMPTIVE_OS_DELETEFILE` | Garbage collection |
 
-The `PREEMPTIVE_OS_*` family is where SQL Server's own FILESTREAM work shows up,
-because Win32 file operations run preemptively — the worker leaves the scheduler
-and the time lands there. Standard "top waits" scripts filter `PREEMPTIVE_*` out
-as noise, which is precisely why FILESTREAM investigations so often come back
-empty-handed. This kit does not filter them.
+SQL Server's own FILESTREAM work shows up in the `PREEMPTIVE_OS_*` family. Win32
+file operations run preemptively: the worker leaves the scheduler, and the time
+lands there. Standard "top waits" scripts filter `PREEMPTIVE_*` out as noise.
+That is why FILESTREAM investigations so often come back empty-handed. This kit
+does not filter them.
 
-**Extended Events** (`FsPoc_Waits`) — `wait_info`, `wait_info_external`,
-`file_write_completed`, `file_read_completed`, `databases_log_flush`,
-`sql_transaction`, `error_reported`. Aggregate deltas tell you *which* waits
-dominated; this tells you *when* and *for how long*, which is what lets you line
-the SQL timeline up against the Procmon timeline.
+**Extended Events** (`FsPoc_Waits`). The session captures `wait_info`,
+`wait_info_external`, `file_write_completed`, `file_read_completed`,
+`databases_log_flush`, `sql_transaction` and `error_reported`. Aggregate deltas
+tell you *which* waits dominated. This tells you *when* and *for how long*, so
+you can line the SQL timeline up against the Procmon timeline.
 
-**DMV activity sampler** — `sys.dm_os_waiting_tasks` every 5s from a dedicated
-runspace, giving the *shape* of the run over time rather than just totals.
+**DMV activity sampler.** A dedicated runspace reads `sys.dm_os_waiting_tasks`
+every 5s. This gives you the *shape* of the run over time, not just the totals.
 
-**Perfmon** — disk latency and throughput per volume, CPU, and the Windows
-system file cache counters (`Memory\Cache Bytes`, `System Cache Resident
-Bytes`). That last group matters more than people expect: FILESTREAM I/O flows
-through the Windows file cache, **not** the SQL Server buffer pool. An
-over-generous `max server memory` starves the cache your FILESTREAM reads depend
-on, and no SQL-side counter will show you that.
+**Perfmon.** The kit collects disk latency and throughput per volume, CPU, and
+the Windows system file cache counters (`Memory\Cache Bytes` and
+`System Cache Resident Bytes`).
 
-**Process Monitor** — the per-file NTFS anatomy. See
+That last group matters more than people expect. FILESTREAM I/O flows through
+the Windows file cache, **not** through the SQL Server buffer pool. A
+`max server memory` value that is too high starves the cache your FILESTREAM
+reads depend on. No SQL-side counter shows you this.
+
+**Process Monitor.** This gives the per-file NTFS anatomy. See
 [`procmon/README.md`](procmon/README.md).
 
 ---
 
-## Azure VM specifics that will otherwise ruin the result
+## Azure VM specifics that otherwise ruin the result
 
-**Separate disks.** A single Azure managed disk has a hard IOPS and MB/s cap.
-If the FILESTREAM container, the transaction log and the Procmon backing file
-share one disk, you are measuring the disk SKU, not FILESTREAM. Minimum viable
-split: container on its own data disk, log on another, results/traces on a
-third. `Setup-FilestreamPoc.ps1` prints the volume layout so you can check.
+**Use separate disks.** A single Azure managed disk has a hard IOPS and MB/s
+cap. If the FILESTREAM container, the transaction log and the Procmon backing
+file share one disk, you measure the disk SKU, not FILESTREAM. The minimum
+viable split puts the container on its own data disk, the log on a second, and
+results and traces on a third. `Setup-FilestreamPoc.ps1` prints the volume
+layout so you can check it.
 
-**Host caching.** Set caching to **None** on the disk holding the container for
-a write-heavy POC. `ReadOnly` helps re-read workloads but inflates write numbers
-in a way that will not survive production.
+**Set host caching to None.** Use `None` on the disk that holds the container
+for a write-heavy POC. `ReadOnly` helps re-read workloads, but it inflates write
+numbers in a way that does not survive production.
 
-**Disk throughput ceiling.** If you hit a flat throughput line, check the disk
-cap before blaming FILESTREAM. Either scale the disk SKU or add a second
-container on another disk — set `FsPath2` in the config and
-`02-create-database.sql` adds it to the same filegroup, which SQL Server fills
-proportionally across both.
+**Watch the disk throughput ceiling.** If you hit a flat throughput line, check
+the disk cap before you blame FILESTREAM. Either scale the disk SKU, or add a
+second container on another disk. Set `FsPath2` in the config, and
+`02-create-database.sql` adds it to the same filegroup. SQL Server then fills
+both containers proportionally.
 
-**Antivirus.** Exclude the container path *and* `sqlservr.exe`. A real-time
-scanner sees every FILESTREAM file as a brand-new file on disk, because it is
-one. This is the most common cause of a bad FILESTREAM POC result, and it is
-invisible from inside SQL Server — the Procmon "every process touching the
-container" table is how you catch it.
+**Exclude the container from antivirus.** Exclude the container path *and*
+`sqlservr.exe`. A real-time scanner sees every FILESTREAM file as a brand-new
+file on disk, because it is one. This is the most common cause of a bad
+FILESTREAM POC result, and you cannot see it from inside SQL Server. The Procmon
+table of every process that touches the container is how you catch it.
 
-**8.3 name generation.** Every file created in a directory that still generates
-short names costs an extra NTFS index insert, and the cost grows
-super-linearly as the directory fills — which is exactly what a container does
-over 160,000 files. `Setup-FilestreamPoc.ps1 -ApplyNtfsTuning` disables it
-(new files only).
+**Disable 8.3 name generation.** Every file created in a directory that still
+generates short names costs an extra NTFS index insert. That cost grows
+super-linearly as the directory fills, which is what a container does over
+160,000 files. `Setup-FilestreamPoc.ps1 -ApplyNtfsTuning` disables it for new
+files only.
 
-**Instant File Initialization.** Grant *Perform volume maintenance tasks* to the
-service account. It does not affect FILESTREAM containers, but it stops MDF
-growth from contaminating the run.
+**Turn on Instant File Initialization.** Grant *Perform volume maintenance
+tasks* to the service account. This does not affect FILESTREAM containers, but
+it stops MDF growth from polluting the run.
 
 ---
 
 ## Between runs
 
-Read the header of `99-cleanup.sql` before reusing the database.
+Read the header of `99-cleanup.sql` before you reuse the database.
 
-Deleting rows does **not** free disk. FILESTREAM files are tombstoned and
-removed by a background garbage collector that only advances past `CHECKPOINT`
-(and, under `FULL` recovery, past a log backup). Start a second run straight
-after a `DELETE` and the GC is still churning in the background — it will
-pollute the numbers. Either drop and recreate the database, or use
-`-v Mode="purge"` and wait for the container to actually shrink on disk.
+A row delete does **not** free disk space. FILESTREAM files are tombstoned. A
+background garbage collector removes them, and it only advances past
+`CHECKPOINT`. Under `FULL` recovery it also waits for a log backup.
+
+Start a second run straight after a `DELETE` and the collector is still running
+in the background. It pollutes the numbers. Either drop and recreate the
+database, or use `-v Mode="purge"` and wait for the container to shrink on disk.
 
 `Invoke-PocRun.ps1 -Matrix` inserts a 60s settle between runs for the same
-reason. On a few hundred GB that is nowhere near enough — drop and recreate
-between large runs.
+reason. On a few hundred GB that settle is nowhere near enough. Drop and
+recreate between large runs.
 
 ---
 
 ## Recovery model
 
-The kit creates the database in `SIMPLE` recovery with a presized 16 GB log, so
-that log growth is not what you end up measuring. That is the right default for
-a throughput baseline and the wrong default for production.
+The kit creates the database in `SIMPLE` recovery with a presized 16 GB log.
+This stops log growth from becoming the thing you measure. It is the right
+default for a throughput baseline and the wrong default for production.
 
 Do a second run in `FULL` recovery before you draw conclusions. Under `FULL`,
-FILESTREAM data is carried in the log backup chain, and backup size, backup
-duration and log management change substantially. `WRITELOG` in the section 2
-analysis is where that will show up.
+the log backup chain carries the FILESTREAM data. Backup size, backup duration
+and log management all change a lot. `WRITELOG` in the section 2 analysis is
+where you see it.
 
 ---
 
@@ -316,25 +331,25 @@ analysis is where that will show up.
 pwsh -File .\tests\Test-FsPocKit.ps1
 ```
 
-Runs three levels of check, because the first is not sufficient on its own and
-this kit has been bitten twice by that:
+The test runs three levels of check. The first level is not enough on its own,
+and this kit has been bitten twice by that.
 
-1. **Parse** — every script parses, the config loads.
-2. **Binding** — every call site to a module function actually binds. A parse
-   check happily accepts `Write-FsPocLog 'msg' 'STEP'` against a function whose
-   second parameter is named-only; it then fails on the first call at runtime.
-   The parser has no opinion about parameter binding.
-3. **Execution** — every platform-independent function is invoked in the forms
-   the scripts use.
+1. **Parse.** Every script parses, and the config loads.
+2. **Binding.** Every call site to a module function binds. A parse check
+   accepts `Write-FsPocLog 'msg' 'STEP'` against a function whose second
+   parameter is named-only. It then fails on the first call at runtime. The
+   parser has no opinion about parameter binding.
+3. **Execution.** The test invokes every platform-independent function in the
+   forms the scripts use.
 
-It runs under PowerShell 7 on any OS. It does **not** cover the `SqlFileStream`
-path, WMI FILESTREAM enablement, or anything else needing Windows and SQL
-Server — `Setup-FilestreamPoc.ps1` ends with a real 50 MB smoke test through
-`SqlFileStream` on the VM, and that is the check that actually matters.
+The test runs under PowerShell 7 on any OS. It does **not** cover the
+`SqlFileStream` path, WMI FILESTREAM enablement, or anything else that needs
+Windows and SQL Server. `Setup-FilestreamPoc.ps1` ends with a real 50 MB smoke
+test through `SqlFileStream` on the VM. That is the check that matters.
 
 ## Changing any path after the first build
 
-Correcting a path in the config is not enough on its own. Run:
+Correcting a path in the config is not enough on its own. Run this:
 
 ```powershell
 .\ps\Reset-FilestreamPoc.ps1            # shows what it would remove
@@ -342,17 +357,17 @@ Correcting a path in the config is not enough on its own. Run:
 ```
 
 The FILESTREAM container's leaf folder must not exist when `CREATE DATABASE`
-runs, and a container left over from a previous build is the usual reason the
-next `CREATE` fails. Reset reads the real file locations from
-`sys.master_files` rather than trusting the config, which matters precisely
-when the config is what you just changed.
+runs. A container left over from a previous build is the usual reason the next
+`CREATE` fails. Reset reads the real file locations from `sys.master_files`
+instead of trusting the config. That matters when the config is the thing you
+just changed.
 
 ## If something fails after the load finishes
 
-Do not re-run the load. Everything the analysis needs is durable the moment
-the ingest returns: the `start` and `end` snapshots are committed to
-`FsPocMonitor`, the per-file timings are already written to per-worker CSVs in
-the run folder, and the Procmon and `.xel` files are on disk.
+Do not re-run the load. Everything the analysis needs is durable the moment the
+ingest returns. The `start` and `end` snapshots are committed to `FsPocMonitor`.
+The per-file timings are already written to per-worker CSVs in the run folder.
+The Procmon and `.xel` files are on disk.
 
 ```powershell
 .\ps\Invoke-PocAnalysis.ps1 -List     # every run, and which artefacts survive
@@ -360,20 +375,20 @@ the run folder, and the Procmon and `.xel` files are on disk.
 .\ps\Invoke-PocAnalysis.ps1 -ConvertProcmon   # also do the expensive PML -> CSV
 ```
 
-`-List` reports, per run, how many of the two wait snapshots exist, how many
-timing rows are imported, and which files remain in the run folder. A run
-showing 2/2 wait snapshots has everything the SQL analysis needs, whatever
-happened afterwards.
+`-List` reports three things per run: how many of the two wait snapshots exist,
+how many timing rows are imported, and which files remain in the run folder. A
+run that shows 2/2 wait snapshots has everything the SQL analysis needs. What
+happened afterwards does not matter.
 
-The PML to CSV conversion is opt-in because it is single-threaded and writes a
-file that can exceed the trace itself — a poor thing to trigger unintentionally
-on a machine that is already unstable under I/O load.
+The PML to CSV conversion is opt-in, because it is single-threaded. It writes a
+file that can be larger than the trace itself. Do not trigger it by accident on
+a machine that is already unstable under I/O load.
 
 ## Known platform issue: bugcheck 0x18 during FILESTREAM ingest
 
-On the first target VM (Windows Server 2022, build 20348.4294, SQL Server 2019
-15.0.4470.1) the machine bugchecked twice during ingest with
-`0x18 REFERENCE_BY_POINTER`. `!analyze -v` on the minidumps gave an identical
+The first target VM ran Windows Server 2022, build 20348.4294, and SQL Server
+2019 15.0.4470.1. The machine bugchecked twice during ingest with
+`0x18 REFERENCE_BY_POINTER`. `!analyze -v` on the minidumps gave the same
 signature both times:
 
 ```
@@ -388,43 +403,44 @@ Ntfs!NtfsIoPerfPostFileObjectInfo       <- and faulted while recording it
 nt!ObfReferenceObject                   -> 0x18
 ```
 
-NTFS observes a high-latency flush, enters its I/O telemetry path to record it,
-and references a file object whose count is already zero.
+NTFS observes a high-latency flush. It enters its I/O telemetry path to record
+the flush. It then references a file object whose count is already zero.
 
-**This is a Windows NTFS defect, not FILESTREAM, not antivirus, and not this
-kit.** A user-mode program cannot corrupt a kernel object's reference count; it
-can only issue I/O that reaches the defective path. `MODULE_NAME: disk` is a
-red herring — `!analyze` attributes the fault to the driver owning the IRP,
-which on a completion-path fault sits several frames below the code that
-faulted.
+**This is a Windows NTFS defect. It is not FILESTREAM, not antivirus, and not
+this kit.** A user-mode program cannot corrupt a kernel object's reference
+count. It can only issue I/O that reaches the defective path. `MODULE_NAME:
+disk` is a red herring. `!analyze` attributes the fault to the driver that owns
+the IRP. On a completion-path fault, that driver sits several frames below the
+code that faulted.
 
 What helps:
 
 | Action | Effect |
 |---|---|
-| Latest Windows cumulative update | May carry a fix; no public KB matches this signature |
+| Latest Windows cumulative update | May carry a fix. No public KB matches this signature |
 | Microsoft support case with the dump | The signature is specific enough to be actionable |
-| Faster disk tier / lower latency | Triggers on *high-latency* flushes, so fewer are reached |
+| Faster disk tier / lower latency | The fault needs *high-latency* flushes, so fewer are reached |
 | Fewer commits (batch files per transaction) | Each commit forces a durability flush |
 
-None of the last two are fixes; they reduce how often the path is reached.
+The last two actions are not fixes. They reduce how often the code reaches the
+defective path.
 
 `ps\Get-CrashEvidence.ps1` establishes whether a restart was a bugcheck or a
-platform reset. `ps\Get-BugcheckAnalysis.ps1` runs `!analyze -v` and classifies
-the result from the whole stack rather than `MODULE_NAME` alone.
+platform reset. `ps\Get-BugcheckAnalysis.ps1` runs `!analyze -v`. It classifies
+the result from the whole stack instead of from `MODULE_NAME` alone.
 
 ## Known gotchas
 
-
 - The FILESTREAM container's **leaf folder must not exist** before
-  `CREATE DATABASE` — SQL Server creates it. The parent must exist. If a drop
-  leaves the folder behind (something held a handle), delete it by hand.
-- `ReFS` is not supported for FILESTREAM containers. NTFS only.
-- The PML→CSV conversion in `Stop-PocCapture.ps1` is single-threaded and slow on
-  large traces. `-SkipProcmonConvert` defers it.
-- Read-back verification is by byte count, not content hash. Hashing would add a
-  round trip inside the interval being timed.
-- If `logman create` reports missing counters, check
-  `perfmon-counters.txt` in the results folder — some counter names differ
-  across Windows builds, and named instances use `MSSQL$INSTANCE:` rather than
-  `SQLServer:` (the kit handles the named-instance case automatically).
+  `CREATE DATABASE`. SQL Server creates it. The parent folder must exist. If a
+  drop leaves the folder behind, something held a handle. Delete the folder by
+  hand.
+- FILESTREAM containers do not support `ReFS`. Use NTFS only.
+- The PML to CSV conversion in `Stop-PocCapture.ps1` is single-threaded and slow
+  on large traces. `-SkipProcmonConvert` defers it.
+- Read-back verification counts bytes. It does not hash content. A hash would
+  add a round trip inside the interval being timed.
+- If `logman create` reports missing counters, check `perfmon-counters.txt` in
+  the results folder. Some counter names differ across Windows builds. Named
+  instances use `MSSQL$INSTANCE:` instead of `SQLServer:`, and the kit handles
+  that case automatically.
