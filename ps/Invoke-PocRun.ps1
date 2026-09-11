@@ -49,6 +49,19 @@ param(
     [switch] $Procmon,
     [int]    $ProcmonDelaySec = 30,
     [int]    $ProcmonWindowSec,
+    <#  Convert the Procmon backing file to CSV as part of this run.
+
+        Off by default. The conversion is single-threaded and writes a CSV that
+        can exceed the trace itself, and it would start the moment a very large
+        load finishes -- the worst possible time, on the machine that has just
+        been hammered for an hour. A previous 200 GB run lost its analysis
+        phase to a bugcheck at exactly this point.
+
+        The .pml is kept either way. Convert and analyse it afterwards, when
+        the machine is quiet, with:
+            .\Invoke-PocAnalysis.ps1 -ConvertProcmon
+    #>
+    [switch] $ConvertProcmon,
     [string] $ProcmonConfig,
     [switch] $NoXEvents,
     [switch] $NoPerfmon,
@@ -231,7 +244,11 @@ function Invoke-OneRun {
             $samplerPs.Dispose(); $samplerRs.Close(); $samplerRs.Dispose()
         }
         # ---- Stop monitoring ----------------------------------------------
-        try { & (Join-Path $ScriptDir 'Stop-PocCapture.ps1') -ResultsDir $resultsDir }
+        try {
+            $stopArgs = @{ ResultsDir = $resultsDir }
+            if ($Procmon -and -not $ConvertProcmon) { $stopArgs.SkipProcmonConvert = $true }
+            & (Join-Path $ScriptDir 'Stop-PocCapture.ps1') @stopArgs
+        }
         catch { Write-FsPocLog "Stop-PocCapture failed: $($_.Exception.Message)" 'WARN' }
     }
 
@@ -246,6 +263,11 @@ function Invoke-OneRun {
 
     # ---- Procmon analysis -------------------------------------------------
     $pmCsv = Join-Path $resultsDir 'procmon.csv'
+    $pmPml = Join-Path $resultsDir 'procmon.pml'
+    if ($Procmon -and -not $ConvertProcmon -and (Test-Path -LiteralPath $pmPml)) {
+        Write-FsPocLog ("Procmon trace kept unconverted: {0} ({1})" -f $pmPml, (Format-FsPocBytes (Get-Item $pmPml).Length)) 'OK'
+        Write-FsPocLog 'Convert and analyse it when the machine is quiet:  .\Invoke-PocAnalysis.ps1 -ConvertProcmon' 'INFO'
+    }
     if ($Procmon -and (Test-Path -LiteralPath $pmCsv)) {
         Write-Host ''
         try { & (Join-Path $ScriptDir 'Measure-ProcmonLog.ps1') -CsvPath $pmCsv -ConfigPath $ConfigPath }
