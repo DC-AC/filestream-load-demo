@@ -83,6 +83,37 @@ FROM #ev
 GROUP BY EventName
 ORDER BY COUNT(*) DESC;
 
+/*  Idle waits are filtered out of the wait sections below.
+
+    Without this the report is led by threads doing nothing.
+    SOS_WORK_DISPATCHER alone reached 57,201 SECONDS of "wait" in a 1,520
+    second run -- idle workers parked waiting for work, which is definitionally
+    not a bottleneck -- and it printed as the top result, above every wait that
+    mattered. FT_SCHEDULER_IDLE_WAIT, QDS_PERSIST_TASK_MAIN_LOOP_SLEEP and
+    EXTENSIBILITY_CLEANUP_TASK followed it, all sleeping on timers.
+
+    Uses the same dbo.BenignWait list as the DMV analysis, matched with and
+    without the PWAIT_ prefix: Extended Events and sys.dm_os_wait_stats do not
+    always spell the same wait type identically.
+*/
+IF OBJECT_ID('tempdb..#benign') IS NOT NULL DROP TABLE #benign;
+GO
+SELECT wait_type INTO #benign FROM dbo.BenignWait
+UNION SELECT REPLACE(wait_type, 'PWAIT_', '') FROM dbo.BenignWait;
+GO
+
+PRINT '';
+PRINT '--- Idle waits excluded below (listed so nothing vanishes silently) -';
+SELECT
+    WaitType,
+    Events   = COUNT(*),
+    TotalSec = CONVERT(decimal(18,1), SUM(RawDuration) / 1000.0)
+FROM #ev
+WHERE EventName IN ('wait_info','wait_info_external')
+  AND EXISTS (SELECT 1 FROM #benign b WHERE b.wait_type = WaitType)
+GROUP BY WaitType
+ORDER BY SUM(RawDuration) DESC;
+
 PRINT '';
 PRINT '--- Wait events by type -------------------------------------------';
 SELECT
@@ -100,6 +131,7 @@ FROM (
                      OVER (PARTITION BY EventName, WaitType)
     FROM #ev
     WHERE EventName IN ('wait_info','wait_info_external')
+      AND NOT EXISTS (SELECT 1 FROM #benign b WHERE b.wait_type = WaitType)
 ) x
 GROUP BY EventName, WaitType
 ORDER BY SUM(RawDuration) DESC;
@@ -110,6 +142,7 @@ SELECT TOP 30
     EventTime, EventName, WaitType, DurationMs = RawDuration, SessionId, DatabaseId
 FROM #ev
 WHERE EventName IN ('wait_info','wait_info_external')
+  AND NOT EXISTS (SELECT 1 FROM #benign b WHERE b.wait_type = WaitType)
 ORDER BY RawDuration DESC;
 
 PRINT '';
@@ -157,6 +190,7 @@ FROM (
                          CONVERT(datetime2(3), CONVERT(date, EventTime)))
     FROM #ev
     WHERE EventName IN ('wait_info','wait_info_external')
+      AND NOT EXISTS (SELECT 1 FROM #benign b WHERE b.wait_type = WaitType)
 ) x
 GROUP BY Second, WaitType
 ORDER BY Second, TotalMs DESC;

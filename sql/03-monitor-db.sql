@@ -397,7 +397,13 @@ BEGIN
         -- 7.5% of total wait time in a 25-minute run purely because it sleeps,
         -- crowding out waits that mean something.
         ('PWAIT_EXTENSIBILITY_CLEANUP_TASK'),('PWAIT_PREEMPTIVE_APP_USAGE_TIMER'),
-        ('SLEEP_RETRY_VIRTUALALLOC'),('PARALLEL_REDO_FLOW_CONTROL');
+        ('SLEEP_RETRY_VIRTUALALLOC'),('PARALLEL_REDO_FLOW_CONTROL'),
+        -- Extended Events reports some wait types WITHOUT the PWAIT_ prefix the
+        -- DMV uses, so both spellings have to be listed for a filter to work
+        -- against either source.
+        ('EXTENSIBILITY_CLEANUP_TASK'),('FT_SCHEDULER_IDLE_WAIT'),
+        ('PREEMPTIVE_XE_SESSIONCOMMIT'),('PREEMPTIVE_XE_TARGETINIT'),
+        ('XE_SESSION_FLUSH'),('SLEEP_TASK_SCHEDULER');
     -- NOTE: FSAGENT is in this list because it is chronically idle-noisy, BUT
     -- if you see it climbing during a heavy FILESTREAM run it is meaningful.
     -- 05-analysis.sql reports it separately for exactly that reason.

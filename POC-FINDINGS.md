@@ -419,6 +419,38 @@ P99 is far from the mean for the larger buckets: Large P99 12.3s against a
 operations stalling rather than data transfer. Size the application's timeouts
 against P99, not the mean.
 
+### The cost is concentrated in a slow minority
+
+The event session captures only waits of 10 ms or more, which makes the gap
+between it and the DMV totals informative: it says how much of each wait's cost
+sits in its slow tail.
+
+| Wait | DMV total | Waits | XE (>=10ms) | Share of waits | Share of time |
+|---|---|---|---|---|---|
+| `FILESTREAM_WORKITEM_QUEUE` | 8,069s | 864,491 | 7,195s | 17% | **89%** |
+| `PREEMPTIVE_OS_CREATEFILE` | 4,015s | 646,700 | 1,907s | 6% | **48%** |
+| `PREEMPTIVE_OS_FILEOPS` | 4,775s | 161,896 | 4,380s | 80% | 92% |
+
+`FILESTREAM_WORKITEM_QUEUE` and `CreateFile` behave the same way: a small
+minority of calls carries most of the cost. Six percent of `CreateFile` waits
+account for half its total time. That is queueing, not a uniform per-call
+price, and it means the average is the wrong number to design against -- the
+mean `CreateFile` wait is 6.2 ms while the slow ones average 46.7 ms and peak
+at 12.1 seconds.
+
+`PREEMPTIVE_OS_FILEOPS` is different: 80% of its waits are already over 10 ms.
+That one is uniformly expensive at ~30 ms per file.
+
+`WRITELOG` over 10 ms totals 160s across the run at a 194 ms maximum. It is not
+a factor at any percentile.
+
+> **Reading the raw shred output.** Before this run the shred applied no benign
+> filter, so it led with `SOS_WORK_DISPATCHER` at 57,201 seconds against a
+> 1,520 second run -- idle workers parked waiting for work. Three more idle
+> timers followed. Fixed: the shred now applies the same `dbo.BenignWait` list
+> as the DMV analysis and prints what it excluded rather than dropping it
+> silently.
+
 ### No bugcheck
 
 Runs on the previous VM took it down twice with `0x18 REFERENCE_BY_POINTER` in
