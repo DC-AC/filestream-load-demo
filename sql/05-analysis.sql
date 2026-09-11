@@ -76,7 +76,8 @@ SELECT TOP ($(TopWaits))
     PctOfWaitTime  = CONVERT(decimal(5,2),
                        100.0 * d.WaitTimeMs / NULLIF(SUM(d.WaitTimeMs) OVER (), 0)),
     Category       = CASE
-        WHEN d.wait_type LIKE 'FS[_]%' OR d.wait_type LIKE 'FSA%' OR d.wait_type LIKE 'FSTR%'
+        WHEN d.wait_type LIKE 'FILESTREAM%' OR d.wait_type LIKE 'FS[_]%'
+          OR d.wait_type LIKE 'FSA%' OR d.wait_type LIKE 'FSTR%'
              THEN '** FILESTREAM **'
         WHEN d.wait_type LIKE 'PREEMPTIVE_OS_%'
              THEN '** WIN32 (external) **'
@@ -106,7 +107,17 @@ SELECT
     WaitTimeSec = CONVERT(decimal(18,1), d.WaitTimeMs / 1000.0),
     AvgWaitMs   = CONVERT(decimal(18,2), d.AvgWaitMs),
     MaxWaitMs   = d.MaxWaitMs,
+    -- Ops per file is what makes these actionable: a count of 4x the file
+    -- count means four of that Win32 call per file written.
+    OpsPerFile = CONVERT(decimal(18,2), d.WaitCount * 1.0 /
+                   NULLIF((SELECT FileCount FROM dbo.PocRun WHERE RunId = @RunId), 0)),
     Meaning = CASE d.wait_type
+        WHEN 'FILESTREAM_WORKITEM_QUEUE' THEN 'FILESTREAM internal work queue -- the agent serialising file operations'
+        WHEN 'FILESTREAM_CACHE'         THEN 'FILESTREAM metadata cache'
+        WHEN 'PREEMPTIVE_OS_RSFXDEVICEOPS' THEN 'Calls into the RsFx FILESTREAM filter driver'
+        WHEN 'PREEMPTIVE_OS_FINDFILE'   THEN 'Directory lookup in the container -- grows with directory size'
+        WHEN 'PREEMPTIVE_OS_GETFILESIZE' THEN 'Win32 GetFileSize on a container file'
+        WHEN 'PREEMPTIVE_OS_DEVICEOPS'  THEN 'Volume/device level Win32 calls'
         WHEN 'FSAGENT'                  THEN 'FILESTREAM agent throttle -- contention on the FS agent'
         WHEN 'FS_FC_RWLOCK'             THEN 'FILESTREAM garbage collector / file control lock'
         WHEN 'FS_GARBAGE_COLLECTION_SHUTDOWN' THEN 'Waiting on GC to drain'
@@ -125,7 +136,8 @@ SELECT
         ELSE '' END
 FROM dbo.vw_WaitDelta d
 WHERE d.RunId = @RunId
-  AND (d.wait_type LIKE 'FS[_]%' OR d.wait_type LIKE 'FSA%' OR d.wait_type LIKE 'FSTR%'
+  AND (d.wait_type LIKE 'FILESTREAM%' OR d.wait_type LIKE 'FS[_]%'
+       OR d.wait_type LIKE 'FSA%' OR d.wait_type LIKE 'FSTR%'
        OR d.wait_type LIKE 'PREEMPTIVE_OS_%')
 ORDER BY d.WaitTimeMs DESC;
 

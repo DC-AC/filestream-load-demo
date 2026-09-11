@@ -312,6 +312,123 @@ paths), and ReFS (all volumes use NTFS).
 
 ---
 
+## Run 4: Premium v1 4k
+
+RunId `60E942B1-FB12-49DA-B7C0-782F851EA8E9`, 2026-09-11.
+Results in `C:\FsPocResults\run_20260911_225442_Filestream_Mixed`.
+
+| | |
+|---|---|
+| Configuration | **Premium v1 4k** |
+| Files | 161,675 |
+| Elapsed | 25m 19s |
+| Throughput | **134.8 MB/s** |
+| Files per second | 106.4 |
+| Errors | **0** |
+| Procmon | active, 120s window, 851.73 MB trace (unconverted) |
+
+Same 8 threads, 4 MB chunk, `Mixed` profile and `SIMPLE` recovery as runs 1-3.
+
+> **This ran on a rebuilt VM.** Treat the comparison against runs 1-3 as
+> indicative, not controlled: the disk SKU is the labelled variable but the
+> machine underneath it was replaced, and nothing in the kit records VM size or
+> allocation unit. Confirm both before quoting 134.8 MB/s against the 104.4 MB/s
+> P40 figure.
+
+### Small files consume the run
+
+Thread-time per bucket, from `IngestTiming` (files x mean open+write+commit):
+
+| Bucket | Files | Mean/file | Thread-sec | % of time | GB | % of bytes |
+|---|---|---|---|---|---|---|
+| Tiny | 122,939 | 39.8 ms | 4,890 | **45.6%** | 4 | 2.0% |
+| Small | 30,754 | 41.2 ms | 1,267 | 11.8% | 16 | 8.0% |
+| Medium | 7,263 | 407.6 ms | 2,961 | 27.6% | 60 | 30.0% |
+| Large | 683 | 2,192 ms | 1,497 | 14.0% | 90 | 45.0% |
+| Huge | 36 | 2,743 ms | 99 | 0.9% | 30 | 15.0% |
+
+**Tiny files are 2% of the bytes and 46% of the elapsed time.** Files under
+1 MB together are 10% of the bytes and 57% of the time. Large and Huge together
+are 60% of the bytes and 15% of the time.
+
+Per thread that is 0.84 MB/s for Tiny against 77.1 MB/s for Large+Huge -- a
+**92x** difference in bytes moved per unit of time, on identical hardware in a
+single run. The cost is per file, not per byte, and it is roughly 40 ms flat:
+a 33 KB file and a 533 KB file cost the same 40 ms.
+
+The 10,714 thread-seconds above divided by 8 threads is 1,339s against 1,520s
+elapsed, so 88% of wall time is accounted for by measured per-file work. The
+remainder is scheduling and queueing.
+
+### Commit is half the cost, and it is not the log
+
+Commit as a share of per-file time rises with size and is the largest component
+in every bucket: Tiny 46%, Small 49%, Medium 52%, Large 56%, Huge 62%. Summed
+across all files, commit is **5,332 thread-seconds -- 49.8% of all measured
+work**.
+
+That time is not log flush. `WRITELOG` totals 488s across the whole run, 9% of
+commit time, at a mean of 2.93 ms. The log wrote 1,374.8 MB for a 200 GB load
+and averaged 1.79 ms per write. **The transaction log is not a bottleneck here
+and moving it will not help.**
+
+What commit actually pays for shows up in the top wait:
+
+| Wait | Time | Waits | Per file | Mean |
+|---|---|---|---|---|
+| `FILESTREAM_WORKITEM_QUEUE` | 8,069s | 864,491 | 5.35 | 9.33 ms |
+| `PREEMPTIVE_OS_FILEOPS` | 4,775s | 161,896 | 1.00 | 29.5 ms |
+| `PREEMPTIVE_OS_CREATEFILE` | 4,015s | 646,700 | **4.00** | 6.21 ms |
+| `PREEMPTIVE_OS_DELETEFILE` | 762s | 472,092 | **2.92** | 1.61 ms |
+| `PREEMPTIVE_OS_FINDFILE` | 42s | 633,237 | 3.92 | 0.07 ms |
+| `WRITELOG` | 488s | 166,710 | 1.03 | 2.93 ms |
+
+`FILESTREAM_WORKITEM_QUEUE` is 40.5% of all wait time and was not visible in
+earlier reports: the analysis classified it as "Other" because the pattern
+`FS[_]%` requires a literal underscore after `FS`. Fixed.
+
+Two counts are worth pursuing:
+
+- **4.00 `CreateFile` per file written.** Exactly four, not approximately four.
+  That is NTFS metadata work the container pays per file and it is the second
+  largest wait.
+- **2.92 `DeleteFile` per file**, 472,092 deletions during a load that only
+  wrote files. Garbage collection ran throughout. Whether it was collecting this
+  run's intermediates or a previous container's tombstones changes what the
+  number means, and the Procmon trace can tell them apart.
+
+Both are answerable from the 851 MB trace already on disk:
+
+```powershell
+.\ps\Invoke-PocAnalysis.ps1 -ConvertProcmon
+```
+
+### The measurement path is sound
+
+`sys.dm_io_virtual_file_stats` recorded 1,374.8 MB written to the log and
+174.4 MB to the MDF for a 200 GB load -- **0.77% of the data**. The other 99.2%
+went through Win32 streaming, invisible to every SQL Server I/O DMV. That is the
+design working as intended, and it is why the client-side timings rather than
+the DMVs carry the result.
+
+### Latency tail
+
+P99 is far from the mean for the larger buckets: Large P99 12.3s against a
+1.68s median, Medium P99 4.2s with a 15.1s maximum. `PREEMPTIVE_OS_FILEOPS` and
+`PREEMPTIVE_OS_CREATEFILE` both peak at ~13.2s, so the tail is Win32 file
+operations stalling rather than data transfer. Size the application's timeouts
+against P99, not the mean.
+
+### No bugcheck
+
+Runs on the previous VM took it down twice with `0x18 REFERENCE_BY_POINTER` in
+`Ntfs!NtfsIoPerfPostFileObjectInfo` on a high-latency flush completion. This run
+completed with Procmon active and zero errors. That is consistent with the
+defect being reached only under high flush latency, but one clean run is not
+evidence it is gone.
+
+---
+
 ## Not yet done
 
 1. **The A/B against in-table `varbinary(max)`.** The POC exists to make this

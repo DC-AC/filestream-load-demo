@@ -392,7 +392,12 @@ BEGIN
         ('WAIT_XTP_RECOVERY'),('WAIT_XTP_HOST_WAIT'),('WAIT_XTP_OFFLINE_CKPT_NEW_LOG'),
         ('WAIT_XTP_CKPT_CLOSE'),('XE_DISPATCHER_JOIN'),('XE_DISPATCHER_WAIT'),
         ('XE_TIMER_EVENT'),('XE_LIVE_TARGET_TVF'),('XE_FILE_TARGET_TVF'),
-        ('SOS_WORK_DISPATCHER'),('VDI_CLIENT_OTHER'),('POPULATE_LOCK_ORDINALS');
+        ('SOS_WORK_DISPATCHER'),('VDI_CLIENT_OTHER'),('POPULATE_LOCK_ORDINALS'),
+        -- Background housekeeping that sleeps in 300s blocks. It surfaced at
+        -- 7.5% of total wait time in a 25-minute run purely because it sleeps,
+        -- crowding out waits that mean something.
+        ('PWAIT_EXTENSIBILITY_CLEANUP_TASK'),('PWAIT_PREEMPTIVE_APP_USAGE_TIMER'),
+        ('SLEEP_RETRY_VIRTUALALLOC'),('PARALLEL_REDO_FLOW_CONTROL');
     -- NOTE: FSAGENT is in this list because it is chronically idle-noisy, BUT
     -- if you see it climbing during a heavy FILESTREAM run it is meaningful.
     -- 05-analysis.sql reports it separately for exactly that reason.

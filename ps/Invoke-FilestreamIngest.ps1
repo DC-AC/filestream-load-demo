@@ -39,6 +39,14 @@ param(
 
     [guid]   $RunId = [guid]::NewGuid(),
     [string] $RunName,
+    <#  A name for the configuration under test, e.g. 'Premium v1 4k'.
+
+        Section 8 of the analysis compares runs, and it can only be read if
+        each row says what was being varied. Scenario and profile are already
+        recorded; the disk SKU, allocation unit, caching mode and VM size are
+        not, and nothing on the machine records them either.
+    #>
+    [string] $Label,
     [string] $ConfigPath,
 
     # Ingest real files from a directory tree instead of synthesising them.
@@ -95,6 +103,7 @@ $poolBytes   = $cfg.RandomPoolMB * 1MB
 $connString  = Get-FsPocConnectionString -Instance $cfg.SqlInstance -Database $cfg.DemoDb
 $resultsDir  = Join-Path $cfg.ResultsPath ("run_{0:yyyyMMdd_HHmmss}_{1}" -f (Get-Date), $Scenario)
 if (-not $RunName) { $RunName = "$Scenario / $($cfg.SizeProfile) / $($cfg.Threads)t / $($cfg.ChunkSizeKB)KB" }
+if ($Label) { $RunName = "$Label | $RunName" }
 
 if ($chunkBytes -gt $poolBytes) {
     throw "ChunkSizeKB ($($cfg.ChunkSizeKB) KB) exceeds RandomPoolMB ($($cfg.RandomPoolMB) MB). Raise RandomPoolMB."
@@ -754,7 +763,10 @@ try {
             $pct, (Format-FsPocBytes $bytes), $files, $instMBs, $avgMBs,
             ([TimeSpan]::FromSeconds([Math]::Max(0, $etaSec)).ToString('hh\:mm\:ss')),
             $errors, ($cfg.Threads - $done), $cfg.Threads)
-        Write-Host ("`r  $status") -NoNewline -ForegroundColor Green
+        # Padded: the line is rewritten with \r, so a shorter status would
+        # otherwise leave the tail of a longer one behind and corrupt the
+        # numbers on screen.
+        Write-Host ("`r  " + $status.PadRight(150)) -NoNewline -ForegroundColor Green
 
         if ($control['FatalWorker'] -ge 0) {
             Write-Host ''

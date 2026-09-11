@@ -40,6 +40,9 @@ param(
 
     [string] $ConfigPath,
     [string] $SourcePath,
+    # Names the configuration under test, e.g. 'Premium v1 4k'. Carried into
+    # RunName so section 8 of the analysis can tell the runs apart.
+    [string] $Label,
     [switch] $Preallocate,
     # Force FileTable writes to stable storage, matching what a FILESTREAM
     # commit does implicitly. Off by default: see Invoke-FilestreamIngest.ps1.
@@ -232,6 +235,7 @@ function Invoke-OneRun {
             RunId = $runId; ConfigPath = $ConfigPath
         }
         if ($SourcePath)     { $ingestArgs.SourcePath = $SourcePath }
+        if ($Label)          { $ingestArgs.Label = $Label }
         if ($Preallocate)    { $ingestArgs.Preallocate = $true }
         if ($FileTableFlush) { $ingestArgs.FileTableFlush = $true }
         $result = & (Join-Path $ScriptDir 'Invoke-FilestreamIngest.ps1') @ingestArgs
