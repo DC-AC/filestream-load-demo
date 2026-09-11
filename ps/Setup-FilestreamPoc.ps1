@@ -28,7 +28,12 @@ param(
     [switch] $SkipSmokeTest,
     [switch] $AddDefenderExclusions,
     [switch] $ApplyNtfsTuning,
-    [switch] $IgnoreVolumeRoles
+    [switch] $IgnoreVolumeRoles,
+    # Report this machine's disk layout and the instance's own default paths,
+    # then exit without changing anything. Run this first on a new VM: the
+    # config is not portable between machines and a wrong volume role produces
+    # numbers that describe the wrong device.
+    [switch] $ShowLayout
 )
 
 Set-StrictMode -Version Latest
@@ -52,6 +57,61 @@ Write-Host ''
 Write-Host '================================================================' -ForegroundColor Cyan
 Write-Host ' FILESTREAM POC -- VM SETUP' -ForegroundColor Cyan
 Write-Host '================================================================' -ForegroundColor Cyan
+
+if ($ShowLayout) {
+    Write-Host ''
+    Write-FsPocLog 'Layout only. Nothing will be changed.' 'STEP'
+
+    Write-Host ''
+    Write-Host ('  {0,-6} {1,-18} {2,12} {3,12} {4,8}' -f 'Drive', 'Label', 'AllocUnit', 'FreeGB', 'FS') -ForegroundColor White
+    Write-Host ('  ' + ('-' * 62)) -ForegroundColor DarkGray
+    Get-CimInstance Win32_Volume -ErrorAction SilentlyContinue |
+        Where-Object { $_.DriveLetter } | Sort-Object DriveLetter | ForEach-Object {
+            Write-Host ('  {0,-6} {1,-18} {2,12:N0} {3,12:N1} {4,8}' -f `
+                $_.DriveLetter, $_.Label, $_.BlockSize, ($_.FreeSpace / 1GB), $_.FileSystem)
+        }
+
+    Write-Host ''
+    try {
+        $d = Invoke-FsPocSql -Instance $cfg.SqlInstance -Database 'master' -Query @'
+SELECT
+    Version     = CONVERT(nvarchar(64),  SERVERPROPERTY('ProductVersion')),
+    Edition     = CONVERT(nvarchar(128), SERVERPROPERTY('Edition')),
+    FsLevel     = CONVERT(int,           SERVERPROPERTY('FilestreamEffectiveLevel')),
+    DefaultData = CONVERT(nvarchar(260), SERVERPROPERTY('InstanceDefaultDataPath')),
+    DefaultLog  = CONVERT(nvarchar(260), SERVERPROPERTY('InstanceDefaultLogPath'))
+'@
+        $r = $d.Rows[0]
+        Write-FsPocLog "SQL Server            : $($r.Version)  $($r.Edition)"
+        Write-FsPocLog "FILESTREAM level      : $($r.FsLevel)  (needs 2 or higher; Setup enables it)"
+        Write-FsPocLog "Instance default data : $($r.DefaultData)"
+        Write-FsPocLog "Instance default log  : $($r.DefaultLog)"
+
+        Write-Host ''
+        Write-FsPocLog 'Suggested ps\FsPocConfig.psd1 values, from the instance defaults:' 'STEP'
+        $dataDrive = if ($r.DefaultData -isnot [DBNull] -and $r.DefaultData) { Split-Path -Qualifier $r.DefaultData } else { 'F:' }
+        $logDrive  = if ($r.DefaultLog  -isnot [DBNull] -and $r.DefaultLog)  { Split-Path -Qualifier $r.DefaultLog }  else { 'G:' }
+        Write-Host ("      DataPath      = '{0}\SQLData'" -f $dataDrive) -ForegroundColor White
+        Write-Host ("      LogPath       = '{0}\SQLLog'"  -f $logDrive)  -ForegroundColor White
+        Write-Host  "      FsPath        = '<a volume that is NOT the data or log volume>\FilestreamData'" -ForegroundColor Yellow
+        Write-Host ("      XePath        = '{0}\XEvents'" -f $dataDrive) -ForegroundColor White
+        Write-Host ''
+        Write-FsPocLog 'The FILESTREAM container must get its own volume. Sharing one with the log' 'WARN'
+        Write-FsPocLog 'measures the disk rather than FILESTREAM, and Setup will refuse to proceed.' 'WARN'
+    }
+    catch {
+        Write-FsPocLog "Could not query the instance: $($_.Exception.Message)" 'WARN'
+        Write-FsPocLog "Check SqlInstance = '$($cfg.SqlInstance)' in $ConfigPath." 'INFO'
+    }
+
+    Write-Host ''
+    Write-FsPocLog 'Current config:' 'STEP'
+    foreach ($k in 'SqlInstance', 'DataPath', 'LogPath', 'FsPath', 'FsPath2', 'XePath', 'ResultsPath', 'ProcmonExe') {
+        Write-Host ("      {0,-12} {1}" -f $k, $cfg.$k) -ForegroundColor Gray
+    }
+    Write-Host ''
+    return
+}
 
 # ---------------------------------------------------------------------------
 # 1. Windows-level FILESTREAM
