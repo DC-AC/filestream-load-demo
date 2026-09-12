@@ -16,9 +16,10 @@ measured.
 | 4 | Premium v1 | 4 KB | B | empty | 161,675 | 25m 19s | 134.7 | 106.4 | 64.8 ms | 0 |
 | 5 | **FileTable**, Premium v1 | 4 KB | B | **not empty** | 162,014 | 33m 58s | 100.5 | 79.5 | 228.0 ms | 0 client / **219 lock timeouts** |
 | 6 | Premium v2 | 4 KB | B | empty | 162,124 | 19m 46s | 172.4 | 136.7 | **41.7 ms** | 0 |
+| 7 | **FileTable**, Premium v2 | 4 KB | B | empty | 161,804 | 28m 26s | 120.0 | 94.8 | 228.9 ms | 0 client / **188 lock timeouts** |
 | - | ~~Premium v1~~ | 64 KB | A | empty | - | 23m 28s | ~~144.9~~ | - | - | **INVALID** |
 
-All runs are `Filestream` (transacted `SqlFileStream`) except run 5.
+All runs are `Filestream` (transacted `SqlFileStream`) except runs 5 and 7.
 **VM A** = `Standard_E8ads_v5`, OS 20348.5256. **VM B** = a rebuild at the same
 VM size, on the same disks, same SQL build. Runs 4-6 were traced with Procmon;
 whether runs 1-3 were is not recorded, because `ProcmonActive` was stored as 0
@@ -54,6 +55,12 @@ time**. Expect a further disk upgrade to return less than this one did.
 **Four `CreateFile` calls per file written**, identical on both SKUs. Structural,
 and the second largest wait.
 
+**FileTable is 30% slower than FILESTREAM, and all of it is small files.** On
+identical hardware into an empty container, FileTable doubled the cost of files
+under 1 MB and was slightly *cheaper* for files above 16 MB. It also carried a
+P95 5.5x worse and 188 internal lock timeouts the client never saw. See
+[run 7](#run-7-filetable-on-premium-v2-the-clean-measurement).
+
 **Client-reported throughput can outrun the disk.** One run reported 144.9 MB/s
 for writes still sitting in the Windows file cache. FILESTREAM writes bypass the
 SQL Server buffer pool and go through that cache, so client numbers need a
@@ -84,11 +91,6 @@ A 64 KB run on the current VM settles it, and it is one reformat plus one run.
 Given the size of the gap that is the highest-value remaining measurement in
 this report -- ahead of the FileTable work, because a 37% configuration lever
 matters more than sizing FileTable's deficit.
-
-**FileTable has no clean measurement.** Run 5 went into a container already
-holding 200 GB, and a populated container costs roughly 2x per-file throughput.
-Its 34% deficit is an upper bound, not a result. The lock timeouts stand
-regardless.
 
 **Not attempted:** the read path, `FULL` recovery, `-FileTableFlush`, and
 multiple FILESTREAM containers across disks.
@@ -578,9 +580,13 @@ same VM, same disk, same 8 threads / 4 MB chunk / `Mixed` profile.
 > is -- and so is the observation that skipping the transaction relocates work
 > rather than removing it. What is not safe to quote is the size of the gap.
 >
-> A FileTable run into an empty container is needed to settle it. The preflight
-> now refuses to start a run against a non-empty container for exactly this
-> reason, which is a guard added after this run rather than before it.
+> **Run 7 settled it**, and the answer barely moved: a clean FileTable run on
+> Premium v2 into an empty container came in 30% behind FILESTREAM against this
+> run's 34%. Directory pressure was not carrying the result. The caveat was
+> right to raise and turned out not to matter.
+>
+> The preflight now refuses to start a run against a non-empty container, a
+> guard added after this run rather than before it.
 
 Setting the confound aside, the direction of the result still contradicts the
 expectation the path was added under. FileTable performs no
@@ -742,6 +748,100 @@ over-reports. Those 6 files were written and committed, and have no row in
 Computed on the database's own figure the throughput is 172.7 MB/s rather than
 172.4. The difference is immaterial; the direction of the error is what matters,
 and it is conservative.
+
+---
+
+## Run 7: FileTable on Premium v2, the clean measurement
+
+RunId `23DBDA08-EC8E-4666-B32A-D8D0AF010E70`. Same VM, same Premium v2 disk,
+same 4 KB allocation unit, same 8 threads / 4 MB chunk / `Mixed` profile,
+**empty container**, Procmon active. The only difference from run 6 is the write
+path.
+
+| | Run 6: Filestream | Run 7: FileTable |
+|---|---|---|
+| Elapsed | **19m 46s** | 28m 26s |
+| Throughput | **172.4 MB/s** | 120.0 MB/s |
+| Files/sec | **136.7** | 94.8 |
+| P95 per file | **41.7 ms** | 228.9 ms |
+| Mean commit | 181-1,731 ms | **0.00 ms** |
+| Top wait | `FILESTREAM_WORKITEM_QUEUE` | `PREEMPTIVE_OS_FILEOPS` |
+| Client errors | 0 | 0 |
+| Internal lock timeouts | 0 | **188** |
+
+**FileTable is 30% slower with a P95 5.5x worse**, while paying literally zero
+commit cost -- `AvgCommitMs` is 0.00 in every bucket, as it must be, since there
+is no transaction.
+
+Run 5 put this at 34% but into a populated container. At 30% clean, directory
+pressure was not what produced that result.
+
+### The penalty is entirely small files
+
+Thread-time per bucket, run 6 against run 7:
+
+| Bucket | Filestream | FileTable | Change |
+|---|---|---|---|
+| Tiny | 2,876s | **6,018s** | **+109%** |
+| Small | 759s | **1,585s** | **+109%** |
+| Medium | 2,673s | 2,783s | +4% |
+| Large | 1,653s | **1,523s** | **-8%** |
+| Huge | 91s | **76s** | **-17%** |
+| **Total** | **8,053s** | **11,985s** | **+49%** |
+
+FileTable **doubles** the cost of every file under 1 MB and is **cheaper** for
+files over 16 MB. Effective per-stream throughput: Tiny 1.4 to 0.7 MB/s, Small
+21.5 to 9.9, Medium 23.0 to 22.0, Large 55.6 to 60.4, Huge 336 to 386.
+
+The crossover sits inside the 1-16 MB band. Above it, the non-transacted path
+wins as originally expected. Below it, it loses by a factor of two.
+
+### Why: per-file namespace resolution
+
+Two waits appear that FILESTREAM runs never show, and together they are 30.7%
+of all wait time:
+
+| Wait | Time | Events | Per file |
+|---|---|---|---|
+| `FFT_NSO_FCB_FIND` | 1,532s | 337,273 | 2.08 |
+| `FFT_NSO_FCB_PARENT` | 1,414s | 314,518 | 1.94 |
+
+`FFT` is FileTable. These are namespace and file-control-block lookups against
+the FileTable hierarchy -- roughly two of each per file, resolving where a new
+file belongs in the `hierarchyid` tree. That cost is per *file*, not per byte,
+which is exactly why it falls entirely on the small buckets.
+
+Two more structural differences:
+
+- **`PREEMPTIVE_OS_FILEOPS`: 9.16 per file against 1.00 for FILESTREAM.** Nine
+  times as many Win32 operations, though each is 17x cheaper (1.27 ms against
+  22.20 ms), netting to about half the total time.
+- **`WRITELOG`: 2.03 per file against 1.01, and 1,188s against 428s.** The
+  non-transacted path generates *more* log work than the transacted one,
+  because every file still becomes a logged row insert carrying a
+  `hierarchyid`. Skipping the transaction does not skip the logging.
+
+`CXPACKET` and `CXROWSET_SYNC` also appear at over a million waits each: some of
+FileTable's namespace maintenance goes parallel, which nothing in the FILESTREAM
+path does.
+
+### The lock timeouts are inherent, not incidental
+
+188 Msg 1222 lock timeouts, against 219 in run 5, on a different disk into a
+different container state. Two runs, consistent rate, invisible to the client
+both times -- 200.00 GB written and zero client-side errors. This is contention
+in FileTable's own row-materialisation path under concurrent writers, and it
+reproduces.
+
+### What to recommend
+
+For a high-concurrency ingest of predominantly small files, **FILESTREAM with
+`SqlFileStream` is the better choice on both counts**: 30% more throughput and
+transactional consistency, not one traded for the other.
+
+FileTable earns its place where files are large, where concurrency is low, or
+where the requirement is a Windows share that applications write to directly.
+Above roughly 16 MB per file it is measurably the faster path.
 
 ---
 
