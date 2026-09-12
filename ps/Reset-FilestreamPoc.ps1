@@ -135,6 +135,16 @@ foreach ($db in $dbs) {
 
     if (-not $Execute) { Write-FsPocLog "WOULD DROP database $db" 'WARN'; continue }
 
+    # This database's own files, read before the drop removes the metadata.
+    $fileRows = Invoke-FsPocSql -Instance $cfg.SqlInstance -Database 'master' -CommandTimeout 60 -Query @"
+SELECT PhysicalPath = mf.physical_name, IsContainer = CASE WHEN mf.type = 2 THEN 1 ELSE 0 END
+FROM sys.master_files mf WHERE mf.database_id = DB_ID(N'$db')
+"@
+    $dbFiles = @($fileRows.Rows | Where-Object { [int]$_.IsContainer -eq 0 } | ForEach-Object { [string]$_.PhysicalPath })
+    foreach ($c in @($fileRows.Rows | Where-Object { [int]$_.IsContainer -eq 1 })) {
+        $dirsToRemove.Add([string]$c.PhysicalPath)
+    }
+
     <#  Report what the drop has to delete, so a long delete reads as slow
         rather than stuck.
 
@@ -164,35 +174,59 @@ SELECT
         Write-FsPocLog 'Could not size the container from the database; proceeding.' 'INFO'
     }
 
-    # Two statements, run separately, so the log says which one is slow.
-    Write-FsPocLog "Setting $db to SINGLE_USER ..." 'STEP'
-    try {
-        Invoke-FsPocSql -Instance $cfg.SqlInstance -Database 'master' -NonQuery -CommandTimeout $TimeoutSeconds `
-            -Query "ALTER DATABASE [$db] SET SINGLE_USER WITH ROLLBACK IMMEDIATE;" | Out-Null
-        Write-FsPocLog "$db is SINGLE_USER" 'OK'
-    }
-    catch {
-        Write-FsPocLog "SET SINGLE_USER did not complete: $($_.Exception.Message)" 'ERROR'
-        Show-Blockers -Instance $cfg.SqlInstance
-        throw
-    }
+    <#  Teardown order: OFFLINE, then DROP, then delete the files ourselves.
 
-    Write-FsPocLog "Dropping $db (deleting the container can take minutes) ..." 'STEP'
-    try {
+        DROP DATABASE on an ONLINE FILESTREAM database deletes the whole
+        container synchronously inside the statement. On 323,689 files that ran
+        past 900 seconds with nothing blocking it -- it was simply doing 323,689
+        NTFS deletes one statement deep, with no progress and no way to
+        interrupt it safely.
+
+        Taking the database offline first makes the DROP a metadata operation.
+        The container is then removed from the file system directly, where
+        `rd /s /q` is markedly faster than either SQL Server or
+        Remove-Item -Recurse, and where progress is visible.
+
+        The file deletion is written to run whether or not the DROP already
+        removed them, so it is correct either way rather than depending on that
+        behaviour.
+    #>
+    $state = Invoke-FsPocSql -Instance $cfg.SqlInstance -Database 'master' -CommandTimeout 60 `
+               -Query "SELECT StateDesc = state_desc FROM sys.databases WHERE name = N'$db'"
+    $currentState = if ($state.Rows.Count -gt 0) { [string]$state.Rows[0].StateDesc } else { 'GONE' }
+    Write-FsPocLog "$db is currently $currentState" 'INFO'
+
+    if ($currentState -ne 'GONE') {
+        if ($currentState -ne 'OFFLINE') {
+            Write-FsPocLog "Taking $db offline ..." 'STEP'
+            try {
+                Invoke-FsPocSql -Instance $cfg.SqlInstance -Database 'master' -NonQuery -CommandTimeout $TimeoutSeconds `
+                    -Query "ALTER DATABASE [$db] SET OFFLINE WITH ROLLBACK IMMEDIATE;" | Out-Null
+                Write-FsPocLog "$db is offline" 'OK'
+            }
+            catch {
+                Write-FsPocLog "SET OFFLINE did not complete: $($_.Exception.Message)" 'ERROR'
+                Show-Blockers -Instance $cfg.SqlInstance
+                throw
+            }
+        }
+
+        Write-FsPocLog "Dropping $db (metadata only -- it is offline) ..." 'STEP'
         Invoke-FsPocSql -Instance $cfg.SqlInstance -Database 'master' -NonQuery -CommandTimeout $TimeoutSeconds `
             -Query "DROP DATABASE [$db];" | Out-Null
         Write-FsPocLog "Dropped $db" 'OK'
     }
-    catch {
-        Write-FsPocLog "DROP DATABASE did not complete within $TimeoutSeconds s: $($_.Exception.Message)" 'ERROR'
-        Show-Blockers -Instance $cfg.SqlInstance
-        Write-Host ''
-        Write-Host '  If nothing is blocking, the drop is simply deleting a very large' -ForegroundColor Yellow
-        Write-Host '  container. Re-run with a longer -TimeoutSeconds, or take the database' -ForegroundColor Yellow
-        Write-Host '  offline and remove the container from the filesystem instead:' -ForegroundColor Yellow
-        Write-Host ("      ALTER DATABASE [$db] SET OFFLINE WITH ROLLBACK IMMEDIATE;") -ForegroundColor Gray
-        Write-Host ("      DROP DATABASE [$db];") -ForegroundColor Gray
-        throw
+    else { Write-FsPocLog "$db no longer exists; cleaning up its files." 'INFO' }
+
+    # The MDF/LDF are left behind when an offline database is dropped, so remove
+    # them too. Missing files are not an error -- the drop may have taken them.
+    # $dbFiles is captured BEFORE the drop, since sys.master_files no longer
+    # lists them afterwards.
+    foreach ($path in $dbFiles) {
+        if (Test-Path -LiteralPath $path) {
+            try { Remove-Item -LiteralPath $path -Force; Write-FsPocLog "Removed $path" 'OK' }
+            catch { Write-FsPocLog "Could not remove $path : $($_.Exception.Message)" 'WARN' }
+        }
     }
 }
 
@@ -233,14 +267,23 @@ Write-Host ''
 if ($unique.Count -eq 0) { Write-FsPocLog 'No container directories left to remove.' 'OK' }
 foreach ($dir in $unique) {
     if ($Execute) {
-        try {
-            Remove-Item -LiteralPath $dir -Recurse -Force
-            Write-FsPocLog "Removed $dir" 'OK'
+        # rd /s /q rather than Remove-Item -Recurse: on a container of a few
+        # hundred thousand files the difference is minutes, because Remove-Item
+        # materialises a PowerShell object per file before deleting any of them.
+        Write-FsPocLog "Removing $dir (this is the slow part -- a few hundred thousand deletes) ..." 'STEP'
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        & cmd.exe /c "rd /s /q `"$dir`"" 2>&1 | Out-Null
+        $sw.Stop()
+
+        if (Test-Path -LiteralPath $dir) {
+            Write-FsPocLog "rd left $dir behind after $([int]$sw.Elapsed.TotalSeconds)s; retrying with Remove-Item ..." 'WARN'
+            try { Remove-Item -LiteralPath $dir -Recurse -Force; Write-FsPocLog "Removed $dir" 'OK' }
+            catch {
+                Write-FsPocLog "Could not remove $dir : $($_.Exception.Message)" 'ERROR'
+                Write-FsPocLog 'Something still holds a handle -- close Explorer windows, stop AV scans, and retry.' 'WARN'
+            }
         }
-        catch {
-            Write-FsPocLog "Could not remove $dir : $($_.Exception.Message)" 'ERROR'
-            Write-FsPocLog 'Something still holds a handle -- close Explorer windows, stop AV scans, and retry.' 'WARN'
-        }
+        else { Write-FsPocLog ("Removed $dir in {0:N0}s" -f $sw.Elapsed.TotalSeconds) 'OK' }
     }
     else { Write-FsPocLog "WOULD REMOVE directory $dir" 'WARN' }
 }
