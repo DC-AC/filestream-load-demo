@@ -461,6 +461,90 @@ evidence it is gone.
 
 ---
 
+## Run 5: FileTable, same disk, same profile
+
+RunId `B9F71085-2BC4-4794-B8CC-CE55B74D0889`, immediately after Run 4 on the
+same VM, same disk, same 8 threads / 4 MB chunk / `Mixed` profile.
+
+| | Run 4: Filestream | Run 5: FileTable |
+|---|---|---|
+| Files | 161,675 | 162,014 |
+| Elapsed | **25m 20s** | 33m 58s |
+| Throughput | **134.7 MB/s** | 100.5 MB/s |
+| P95 per file | **64.8 ms** | 228.0 ms |
+| Top wait | `FILESTREAM_WORKITEM_QUEUE` | `PREEMPTIVE_OS_FILEOPS` |
+| Client-visible errors | 0 | 0 |
+
+**FileTable was 34% slower with a P95 3.5x worse.**
+
+This contradicts the expectation the path was added under. FileTable performs no
+transaction and no commit flush, so it should have been the cheaper of the two;
+the kit's own documentation said to expect it to win and to read the gap as the
+price of transactional consistency. On this hardware the gap runs the other way,
+and transactional consistency came free.
+
+Do not generalise this to "FileTable is slow". It is one configuration on one
+disk. What it does establish is that the cheaper-looking path is not
+automatically the faster one, and that the question has to be measured rather
+than reasoned about.
+
+### Why: the work moves, it does not disappear
+
+Skipping the transaction does not remove the work, it relocates it. Comparing
+what SQL Server saw in each run:
+
+| | Filestream | FileTable |
+|---|---|---|
+| `sql_transaction` events | 648,132 | **1,778** |
+| MDF/LDF written | 64.8 MB | **131.0 MB** |
+| `WRITELOG` waits >=10ms | 12,150 | **5** |
+
+SQL Server is almost idle during the FileTable run -- 365x fewer transaction
+events, essentially no log pressure. Yet it finished slower. The cost moved into
+two places the transactional path does not pay:
+
+1. **The SMB loopback.** The client writes to
+   `\\SQL1\MSSQLSERVER\FsPocDemo\FileStoreFT\...` rather than through a
+   streaming handle. Even on the same machine that traverses the SMB redirector
+   and the server stack.
+2. **Row materialisation.** Every file becomes a row carrying a `hierarchyid`
+   `path_locator`, name, and attributes, built by the filter driver outside any
+   transaction the client controls. That is why FileTable wrote *twice* as much
+   to the MDF and LDF while running 365x fewer transactions.
+
+### Lock timeouts, invisible to the client
+
+The event session captured **219 `error_reported` events, every one Msg 1222,
+"Lock request time out period exceeded"**, spread across at least 15 distinct
+session ids over the whole run.
+
+The client reported zero errors and wrote all 200.00 GB, so these are internal
+retries, not lost work. They are still a finding: nothing in the client-side
+timings or the DMV wait deltas shows them, and they are the clearest signal
+available that the FileTable row-materialisation path is contending with itself
+under concurrent load. The 3.5x P95 penalty and these timeouts are very likely
+the same phenomenon.
+
+This is the strongest argument in the report for capturing `error_reported` in
+the event session. A run that looks clean from the client is not necessarily
+clean.
+
+### What this changes
+
+For a write-heavy ingest at this concurrency, FILESTREAM with `SqlFileStream` is
+both **faster and transactional**. There is no trade to make: the non-transacted
+path costs throughput, costs tail latency, and gives up atomicity with the row.
+
+FileTable remains the right answer when the requirement is a Windows file share
+that applications write to directly. It is not the right answer for a
+high-concurrency ingest pipeline, which is what this profile models.
+
+Still unmeasured: FileTable with `-FileTableFlush` (forcing stable storage per
+file, matching what a FILESTREAM commit does implicitly), and the read side.
+Both would sharpen this, and neither is likely to reverse a 34% gap.
+
+---
+
 ## Not yet done
 
 1. **The A/B against in-table `varbinary(max)`.** The POC exists to make this
