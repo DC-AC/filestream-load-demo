@@ -209,13 +209,11 @@ if ($Procmon) {
     }
 }
 
-# Mark the run as procmon-instrumented so analysis does not compare an
-# instrumented run against a clean one without saying so.
-if ($Procmon) {
-    Invoke-FsPocSql -Instance $cfg.SqlInstance -Database $cfg.MonitorDb -NonQuery `
-        -Query 'UPDATE dbo.PocRun SET ProcmonActive = 1 WHERE RunId = @RunId' `
-        -Parameters @{ RunId = $RunId } -ErrorAction SilentlyContinue | Out-Null
-}
+# ProcmonActive is NOT set here. This script runs before Invoke-FilestreamIngest
+# calls usp_StartRun, so the PocRun row does not exist yet and an UPDATE against
+# it matches zero rows -- which is exactly what used to happen, leaving every
+# traced run recorded as untraced. The ingest engine takes -ProcmonActive and
+# records it when it registers the run.
 
 $statePath = Join-Path $ResultsDir 'capture-state.json'
 $state | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $statePath -Encoding UTF8

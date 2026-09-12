@@ -68,6 +68,17 @@ param(
     #>
     [switch] $FileTableFlush,
 
+    <#  Record that this run was traced with Process Monitor.
+
+        Passed in rather than set by the capture scripts: Start-PocCapture runs
+        BEFORE usp_StartRun creates the PocRun row, so its
+        "UPDATE ... SET ProcmonActive = 1" matched zero rows and the flag was
+        silently 0 on every run ever recorded -- including a 200 GB run that
+        was genuinely traced. The flag exists so a traced run is not compared
+        against a clean one as though the overhead were not there.
+    #>
+    [switch] $ProcmonActive,
+
     # Skip writing run metadata / snapshots to FsPocMonitor (raw throughput only).
     [switch] $NoMonitorDb,
 
@@ -201,7 +212,9 @@ EXEC dbo.usp_StartRun @RunId, @RunName, @Scenario, @TargetDb, @Threads,
 '@ -Parameters @{
             RunId = $RunId; RunName = $RunName; Scenario = $Scenario; TargetDb = $cfg.DemoDb
             Threads = $cfg.Threads; ChunkSizeKB = $cfg.ChunkSizeKB; SizeProfile = $cfg.SizeProfile
-            TargetBytes = $targetBytes; ProcmonActive = 0; ParamsJson = $paramsJson
+            TargetBytes = $targetBytes
+            ProcmonActive = [int][bool]$ProcmonActive
+            ParamsJson = $paramsJson
         } | Out-Null
     Write-FsPocLog 'Run registered in FsPocMonitor.' 'OK'
 }

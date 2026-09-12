@@ -269,6 +269,9 @@ function Invoke-OneRun {
         if ($Label)          { $ingestArgs.Label = $Label }
         if ($Preallocate)    { $ingestArgs.Preallocate = $true }
         if ($FileTableFlush) { $ingestArgs.FileTableFlush = $true }
+        # Recorded on the run row itself, because Start-PocCapture cannot: it
+        # runs before the row exists.
+        if ($Procmon)        { $ingestArgs.ProcmonActive = $true }
         $result = & (Join-Path $ScriptDir 'Invoke-FilestreamIngest.ps1') @ingestArgs
     }
     finally {
