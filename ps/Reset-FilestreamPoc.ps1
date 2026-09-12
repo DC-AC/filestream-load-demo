@@ -29,7 +29,19 @@ param(
     # forever behind a session or a handle. A finite timeout distinguishes the
     # two; the default Invoke-FsPocSql timeout of 0 means "wait forever", which
     # tells you nothing.
-    [int] $TimeoutSeconds = 900
+    [int] $TimeoutSeconds = 900,
+    <#  Also drop the monitoring database.
+
+        Off by default, and deliberately so. FsPocMonitor exists precisely to
+        OUTLIVE the demo database -- 03-monitor-db.sql says so in its header --
+        because it accumulates the run history that section 8 of the analysis
+        compares across configurations. Dropping it discards every previous
+        run's wait snapshots and per-file timings, which is exactly the data a
+        disk or VM change is being measured against.
+
+        Reset was dropping it by default, which contradicted its whole purpose.
+    #>
+    [switch] $IncludeMonitorDb
 )
 
 Set-StrictMode -Version Latest
@@ -70,10 +82,25 @@ Write-Host ' FILESTREAM POC RESET' -ForegroundColor Cyan
 Write-Host '================================================================' -ForegroundColor Cyan
 if (-not $Execute) { Write-FsPocLog 'DRY RUN. Re-run with -Execute to actually remove anything.' 'WARN' }
 
+if ($IncludeMonitorDb) {
+    Write-FsPocLog "-IncludeMonitorDb: $($cfg.MonitorDb) WILL be dropped, discarding all previous run history." 'WARN'
+}
+else {
+    # Say what is being kept, so it is not a silent assumption either way.
+    try {
+        $hist = Invoke-FsPocSql -Instance $cfg.SqlInstance -Database $cfg.MonitorDb -CommandTimeout 30 `
+                  -Query 'SELECT Runs = COUNT(*), Timings = (SELECT COUNT_BIG(*) FROM dbo.IngestTiming) FROM dbo.PocRun'
+        Write-FsPocLog ("Keeping $($cfg.MonitorDb): {0} run(s), {1:N0} timing rows. Use -IncludeMonitorDb to drop it too." -f `
+            $hist.Rows[0].Runs, $hist.Rows[0].Timings) 'OK'
+    }
+    catch { Write-FsPocLog "Keeping $($cfg.MonitorDb) (could not read its contents: $($_.Exception.Message))" 'INFO' }
+}
+
 # ---------------------------------------------------------------------------
 # Where do the files actually live right now?
 # ---------------------------------------------------------------------------
-$dbs = @($cfg.DemoDb, $cfg.MonitorDb)
+$dbs = @($cfg.DemoDb)
+if ($IncludeMonitorDb) { $dbs += $cfg.MonitorDb }
 $dirsToRemove = New-Object System.Collections.Generic.List[string]
 
 foreach ($db in $dbs) {
