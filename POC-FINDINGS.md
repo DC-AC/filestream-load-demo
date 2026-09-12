@@ -545,6 +545,97 @@ Both would sharpen this, and neither is likely to reverse a 34% gap.
 
 ---
 
+## Run 6: Premium v2 4k
+
+RunId `7839AF0C-31B0-41FD-B639-25E000E554D9`. Same VM, same 8 threads, 4 MB
+chunk, `Mixed` profile, `SIMPLE` recovery, empty container, Procmon active.
+Only the disk SKU changed, converted in place: deallocate, change SKU, start.
+
+| | Premium v1 4k | **Premium v2 4k** | Change |
+|---|---|---|---|
+| Elapsed | 25m 20s | **19m 46s** | -22% |
+| Throughput | 134.7 MB/s | **172.4 MB/s** | **+28%** |
+| Files/sec | 106.4 | **136.7** | +28% |
+| P95 per file | 64.8 ms | **41.7 ms** | -36% |
+| Worst single file | 15,097 ms | 17,511 ms | **+16%** |
+| Top wait | `FILESTREAM_WORKITEM_QUEUE` | `FILESTREAM_WORKITEM_QUEUE` | unchanged |
+
+### The entire gain came from small files
+
+Thread-time per bucket, both runs, from `IngestTiming`:
+
+| Bucket | v1 thread-sec | v2 thread-sec | Change |
+|---|---|---|---|
+| Tiny | 4,890 | **2,876** | **-41%** |
+| Small | 1,267 | **759** | **-40%** |
+| Medium | 2,961 | 2,673 | -10% |
+| Large | 1,497 | **1,653** | **+10%** |
+| Huge | 99 | 91 | -8% |
+| **Total** | **10,714** | **8,053** | **-25%** |
+
+Of the 2,661 thread-seconds saved, **2,522 -- 95% -- came from Tiny and Small
+alone.** Medium contributed the rest. Large got *slower*: 61.6 MB/s per stream
+down to 55.6.
+
+That is the shape a per-operation improvement makes, not a bandwidth one. v2
+helped precisely where v1 was weakest, and did nothing for the large sequential
+writes that were already close to the device's streaming limit. Per-file mean
+cost for a 33 KB file fell from 39.8 ms to 23.3 ms; for a 135 MB file it rose
+from 2,192 ms to 2,449 ms.
+
+This settles the question the earlier runs raised. On the old VM, an 18% faster
+disk bought 8% more ingest, and the conclusion drawn was that the disk had
+stopped being the constraint. It had stopped being a *bandwidth* constraint.
+Provisioned IOPS was still on the table, and it was worth 28%.
+
+### The ceiling is moving off the disk
+
+Server-side wait time fell across the board, but not evenly:
+
+| Wait | v1 | v2 | Change | v2 mean | Ops/file |
+|---|---|---|---|---|---|
+| `FILESTREAM_WORKITEM_QUEUE` | 8,069s | 6,334s | -22% | 6.7 ms | 5.81 |
+| `PREEMPTIVE_OS_CREATEFILE` | 4,015s | 2,786s | **-31%** | 4.3 ms | **4.00** |
+| `PREEMPTIVE_OS_FILEOPS` | 4,775s | 3,601s | -25% | 22.2 ms | 1.00 |
+| `WRITELOG` | 488s | 428s | -12% | 2.6 ms | 1.01 |
+
+`CreateFile` improved most, which is consistent: it is the NTFS metadata
+operation, four per file, and metadata operations are IOPS-bound.
+
+But `FILESTREAM_WORKITEM_QUEUE` **grew as a share of total wait time, from 40.5%
+to 42.7%**, despite falling 22% in absolute terms. It is the FILESTREAM agent
+serialising file operations, and it is not a disk wait. As the storage gets
+faster it becomes a larger fraction of what remains. A third disk upgrade should
+be expected to return less than this one did.
+
+Exactly 4.00 `CreateFile` calls per file written, on both SKUs. That number is
+structural, not incidental.
+
+### Tail behaviour diverged
+
+P95 improved 36% while the worst single file got 16% worse, and the largest
+individual waits rose on every Win32 operation (`CreateFile` 13.2s to 16.9s,
+`FILEOPS` 13.2s to 16.2s). Typical latency improved and the extreme tail did
+not. Quote P95 for capacity planning; do not promise anything about the
+maximum.
+
+### Measurement note: the client under-reported by 6 files
+
+The client recorded 162,124 files and 199.70 GB. The database holds **162,130
+files and 200.00 GB** -- 6 more files, 0.30 GB more.
+
+This is the commit-timeout ambiguity documented for run 1, at a smaller scale. A
+commit that outruns its timeout leaves the client unable to tell whether the
+server committed; it assumes failure, so it under-reports rather than
+over-reports. Those 6 files were written and committed, and have no row in
+`IngestTiming`, so the per-bucket tables above exclude them.
+
+Computed on the database's own figure the throughput is 172.7 MB/s rather than
+172.4. The difference is immaterial; the direction of the error is what matters,
+and it is conservative.
+
+---
+
 ## Not yet done
 
 1. **The A/B against in-table `varbinary(max)`.** The POC exists to make this
