@@ -119,6 +119,33 @@ multiple FILESTREAM containers across disks.
 
 ---
 
+## Per-stream throughput by file size
+
+Effective MB/s per stream, measured client-side per file. This is the single most
+informative view in the report: the three configurations nearly touch at the small
+end and fan apart by a factor of four at the large end.
+
+| Bucket | Avg size | Run 2<br>v2, 64 KB | Run 6<br>v2, 4 KB | Run 7<br>FileTable, 4 KB |
+|---|---|---|---|---|
+| Tiny | 0.03 MB | 1.7 | 1.4 | 0.7 |
+| Small | 0.53 MB | 24.7 | 21.5 | 9.9 |
+| Medium | 8.5 MB | 42.2 | 23.0 | 22.0 |
+| Large | 135 MB | **145.7** | 55.6 | 60.4 |
+| Huge | ~1 GB | **784.7** | 336.0 | 385.6 |
+
+Three things read straight off it:
+
+- **Run 2 pulls away as files grow, not as they shrink.** Tiny differs by 21%,
+  Huge by 134%. Whatever separates 64 KB from 4 KB here acts on bandwidth-bound
+  sequential writes, not on per-file metadata.
+- **FileTable crosses over inside the Medium band.** Below it, roughly half the
+  throughput of FILESTREAM; above it, slightly better.
+- **Every configuration is within a factor of 2.5 at Tiny and a factor of 2.3 at
+  Huge, but the absolute numbers differ by 500x between those two buckets.** File
+  size dominates every other variable measured.
+
+---
+
 ## Environment
 
 | | |
@@ -869,33 +896,90 @@ Above roughly 16 MB per file it is measurably the faster path.
 
 ## Not yet done
 
-1. **The A/B against in-table `varbinary(max)`.** The POC exists to make this
-   comparison, and it has not run. `Invoke-PocRun.ps1 -Matrix` covers it. Without
-   it, everything above describes the cost curve of FILESTREAM in isolation.
+1. **The A/B against in-table `varbinary(max)`.** Still not run.
+   `Invoke-PocRun.ps1 -Matrix` covers it. FILESTREAM has now been measured
+   against FileTable, but not against storing the bytes in the row, which is the
+   comparison most applications actually face below 1 MB.
+0. **Which of bandwidth or cluster size explains the 37% gap.** See
+   [the summary](#what-is-not-settled). One provisioning check, free, and it
+   decides whether a reformat is worth running at all.
 2. **A `FULL` recovery run.** Every run so far used `SIMPLE`. Under `FULL` the
    log backup chain carries the FILESTREAM data. Backup size, backup duration and
    log management all change a lot.
 3. **The read path.** `FilestreamRead` and `BlobRead` have not run. Ingest
    performance alone is half an answer.
-4. **Process Monitor per-operation anatomy.** No capture has succeeded. Procmon
-   cannot generate a `.pmc` config file headlessly. Procmon 4.1 has `/LoadConfig`
-   but no `/SaveConfig`, and it ignores a hand-written `.pmc` without a message.
-   The GUI export in `procmon/README.md` is the only route. Until then we have no
-   NTFS-level breakdown of the per-file time.
+4. **Process Monitor per-operation anatomy.** Capture now works -- runs 4, 6 and
+   7 produced traces of 852 MB, 1.20 GB and 509 MB. None has been converted to
+   CSV and analysed, so there is still no NTFS-level breakdown of the per-file
+   time. That analysis would settle the two structural counts this report can
+   state but not explain: **4.00 `CreateFile` calls per file written**, and
+   **2.87 `DeleteFile` per file** from garbage collection running throughout an
+   insert-only load. Conversion is deliberately opt-in
+   (`Invoke-PocAnalysis.ps1 -ConvertProcmon`) because it is single-threaded and
+   writes a CSV larger than the trace.
 5. **A batched-commit test.** The commit costs more than the write in every
    bucket on every disk. The ingest uses one transaction per file, so nobody has
    measured what batching would return.
 
 ---
 
+## How these numbers were taken
+
+Each run synthesises 200 GB from an in-memory pool of cryptographic random bytes
+written at random offsets, so the data is incompressible -- defeating NTFS
+compression, host-level dedup and any storage-side compression that would
+otherwise inflate throughput -- and nothing is staged to disk first, so a 200 GB
+run needs 200 GB of capacity rather than 400.
+
+File sizes straddle the FILESTREAM crossover deliberately. Shares are of *bytes*,
+not file count, which is why the small buckets carry enormous file counts:
+
+| Bucket | Size range | Share of bytes | Files per run |
+|---|---|---|---|
+| Tiny | 4 KB - 64 KB | 2% | ~123,000 |
+| Small | 64 KB - 1 MB | 8% | ~31,000 |
+| Medium | 1 MB - 16 MB | 30% | ~7,200 |
+| Large | 16 MB - 256 MB | 45% | ~680 |
+| Huge | 256 MB - 2000 MB | 15% | ~35 |
+
+Per-file `open`, `write` and `commit` timings are captured **client-side**,
+because Win32 streaming writes never pass through SQL Server's I/O stack.
+`sys.dm_io_virtual_file_stats` recorded 0.77% of the data volume in run 4; no DMV
+can see the other 99.2%. Wait statistics are snapshot deltas either side of the
+run. An Extended Events session captures waits over 10 ms, which is what makes
+the slow-tail analysis possible. Process Monitor traces a 120-second window at
+steady state rather than the whole run -- tracing throughout would change the
+number being measured.
+
+The Huge bucket holds 33-36 files per run. Treat its numbers as indicative.
+
+---
+
 ## Reproducing
 
 ```powershell
-# clean baseline - the container must be empty, or directory pressure
-# costs roughly 2x per-file throughput
-sqlcmd -S . -E -b -i sql\99-cleanup.sql -v DbName="FsPocDemo" Mode="drop"
-.\ps\Setup-FilestreamPoc.ps1
-.\ps\Invoke-PocRun.ps1 -Scenario Filestream -TargetGB 200
+# 1. Inspect the machine first - the config is not portable between VMs
+.\ps\Setup-FilestreamPoc.ps1 -ShowLayout
+
+# 2. Clean baseline. The container MUST be empty or directory pressure costs
+#    roughly 2x per-file throughput; the preflight now refuses to start if it
+#    is not. Reset keeps FsPocMonitor, so previous runs stay comparable.
+.\ps\Reset-FilestreamPoc.ps1 -Execute
+powershell.exe -ExecutionPolicy Bypass -File .\ps\Setup-FilestreamPoc.ps1 -SkipSmokeTest
+
+# 3. Verify the streaming path with one file before committing to 200 GB
+powershell.exe -ExecutionPolicy Bypass -File .\ps\Test-FilestreamPath.ps1
+
+# 4. Run. -Label names the configuration so section 8 can tell runs apart.
+.\ps\Invoke-PocRun.ps1 -Scenario Filestream -TargetGB 200 -Label 'Premium v2 64k'
+```
+
+If anything fails *after* the load completes, do not re-run it. Every input the
+analysis needs is durable by then:
+
+```powershell
+.\ps\Invoke-PocAnalysis.ps1 -List   # which artefacts survive, per run
+.\ps\Invoke-PocAnalysis.ps1         # re-run the reporting only
 ```
 
 The drop takes about 30 seconds on a disk with enough IOPS. Allow 10 minutes on
