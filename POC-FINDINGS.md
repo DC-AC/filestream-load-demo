@@ -68,29 +68,51 @@ Perfmon cross-check before anyone quotes them.
 
 ### What is not settled
 
-**A 37% gap that nothing in this report explains.** Premium v2 returned
-274.5 MB/s at a 64 KB allocation unit (run 2) and 172.4 MB/s at 4 KB (run 6).
-The disk and the VM size were the same. That leaves allocation unit as the
-leading candidate for a 37% difference -- larger than the v1-to-v2 upgrade this
-report spent three runs measuring.
+**A 37% gap, and the per-bucket data says it is bandwidth, not cluster size.**
+Premium v2 returned 274.5 MB/s at a 64 KB allocation unit (run 2) and
+172.4 MB/s at 4 KB (run 6), on the same disk at the same VM size. Cluster size
+was the obvious suspect. The per-bucket numbers do not support it.
 
-It is not yet safe to credit, for two reasons:
+Effective MB/s per stream, run 2 (64 KB) against run 6 (4 KB):
 
-1. **The v1 pair points the other way.** Run 1 (64 KB) managed 104.4 MB/s while
-   run 4 (4 KB) managed 134.7 MB/s -- 4 KB *faster* by 29%. Run 1 also used
-   `ReadOnly` host caching, which this report elsewhere finds never helps
-   writes, so that comparison is not clean either. But two allocation-unit
-   comparisons disagreeing in direction means neither is a measurement.
-2. **Run 6 ran with Procmon active; whether runs 2 and 3 did is not recorded.**
-   `ProcmonActive` was silently stored as 0 on every run until the bug was
-   fixed, so the flag cannot answer this retrospectively. Tracing is windowed
-   to 120s of a ~1,200s run, so it should account for a few percent at most --
-   nowhere near 37% -- but it is a known uncontrolled difference.
+| Bucket | Run 2, 64 KB | Run 6, 4 KB | Change |
+|---|---|---|---|
+| Tiny (0.03 MB) | 1.7 | 1.4 | -18% |
+| Small (0.53 MB) | 24.7 | 21.5 | -13% |
+| Medium (8.5 MB) | 42.2 | 23.0 | -45% |
+| Large (135 MB) | 145.7 | **55.6** | **-62%** |
+| Huge (~1 GB) | 784.7 | **336.0** | **-57%** |
 
-A 64 KB run on the current VM settles it, and it is one reformat plus one run.
-Given the size of the gap that is the highest-value remaining measurement in
-this report -- ahead of the FileTable work, because a 37% configuration lever
-matters more than sizing FileTable's deficit.
+Median latency per file tells it more sharply still:
+
+| Bucket | Run 2, 64 KB | Run 6, 4 KB |
+|---|---|---|
+| Tiny | 18.0 ms | 21.0 ms |
+| Small | 18.0 ms | **15.5 ms** (better) |
+| Medium | 25.4 ms | 24.1 ms |
+| Large | 716 ms | **2,289 ms** |
+| Huge | 990 ms | **2,536 ms** |
+
+**Small-file latency is unchanged. Large-file latency tripled.**
+
+A cluster-size effect works through metadata: allocation, `$Bitmap` updates,
+MFT runlists. That cost is largest relative to file size on *small* files, and
+small files are exactly where these two runs agree -- Small is fractionally
+*faster* at 4 KB. Meanwhile Large and Huge, which are bandwidth-bound sequential
+writes, lost 60%.
+
+That is the signature of a **lower throughput ceiling on the disk**, not of
+filesystem geometry. Large files are 60% of the bytes in this profile, so a 60%
+loss there produces the 37% overall gap on its own.
+
+Run 3 is described in this report as PremiumV2 "with more IOPS and bandwidth"
+than run 2, so provisioning was already being varied on these disks. **Before
+reformatting anything, compare the current disk's provisioned MB/s and IOPS
+against what run 2 used.** If they differ, that explains the gap and allocation
+unit is a red herring.
+
+If they match, cluster size comes back into play and a 64 KB run on the current
+VM settles it. Either way that check costs nothing and should come first.
 
 **Not attempted:** the read path, `FULL` recovery, `-FileTableFlush`, and
 multiple FILESTREAM containers across disks.
