@@ -135,20 +135,33 @@ foreach ($db in $dbs) {
 
     if (-not $Execute) { Write-FsPocLog "WOULD DROP database $db" 'WARN'; continue }
 
-    # Report what the drop has to delete. A container holding hundreds of
-    # thousands of small NTFS files takes real time to remove, and knowing the
-    # count up front is the difference between "slow" and "stuck".
-    $fsDirs = @($info.Rows | Where-Object FileType -eq 'FILESTREAM' | ForEach-Object { $_.PhysicalPath })
-    foreach ($fsDir in $fsDirs) {
-        try {
-            $inv = Get-ChildItem -LiteralPath $fsDir -Recurse -File -ErrorAction SilentlyContinue |
-                   Measure-Object Length -Sum
-            if ($inv.Count -gt 0) {
-                Write-FsPocLog ("Container holds {0:N0} file(s), {1}. The drop must delete all of them." -f `
-                    $inv.Count, (Format-FsPocBytes $inv.Sum)) 'INFO'
-            }
+    <#  Report what the drop has to delete, so a long delete reads as slow
+        rather than stuck.
+
+        Asked of SQL Server, not of the file system. The previous version walked
+        the container with Get-ChildItem -Recurse, which on a container holding
+        a few hundred thousand files across a deep GUID directory tree takes
+        minutes on its own -- before deleting anything, purely to print one
+        line. The row counts and byte totals are already indexed in the
+        database and answer the same question instantly.
+    #>
+    try {
+        $inv = Invoke-FsPocSql -Instance $cfg.SqlInstance -Database $db -CommandTimeout 60 -Query @'
+SELECT
+    Files = ISNULL((SELECT COUNT_BIG(*) FROM dbo.FileStore), 0)
+          + ISNULL((SELECT COUNT_BIG(*) FROM dbo.FileStoreFT WHERE is_directory = 0), 0),
+    Bytes = ISNULL((SELECT SUM(SizeBytes) FROM dbo.FileStore), 0)
+          + ISNULL((SELECT SUM(CONVERT(bigint, DATALENGTH(file_stream))) FROM dbo.FileStoreFT WHERE is_directory = 0), 0)
+'@
+        $files = [long]$inv.Rows[0].Files
+        if ($files -gt 0) {
+            Write-FsPocLog ("Container holds {0:N0} file(s), {1}. DROP DATABASE must delete every one of them, so allow minutes." -f `
+                $files, (Format-FsPocBytes ([double]$inv.Rows[0].Bytes))) 'INFO'
         }
-        catch { }
+    }
+    catch {
+        # A database with no FileStore/FileStoreFT, or one already unusable.
+        Write-FsPocLog 'Could not size the container from the database; proceeding.' 'INFO'
     }
 
     # Two statements, run separately, so the log says which one is slow.
