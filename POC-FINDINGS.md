@@ -133,39 +133,48 @@ multiple FILESTREAM containers across disks.
 
 ## Per-stream throughput by file size
 
-Effective MB/s per stream, measured client-side per file. This is the single most
-informative view in the report: the three configurations nearly touch at the small
-end and fan apart by a factor of four at the large end.
+Effective MB/s per stream, client-measured per file. Every run, every bucket.
+This is the single most informative view in the report, and the one that
+explains every headline number above.
 
-| Bucket | Avg size | Run 2<br>v2, 64 KB | Run 6<br>v2, 4 KB | Run 7<br>FileTable, 4 KB |
-|---|---|---|---|---|
-| Tiny | 0.03 MB | 1.7 | 1.4 | 0.7 |
-| Small | 0.53 MB | 24.7 | 21.5 | 9.9 |
-| Medium | 8.5 MB | 42.2 | 23.0 | 22.0 |
-| Large | 135 MB | **145.7** | 55.6 | 60.4 |
-| Huge | ~1 GB | **784.7** | 336.0 | 385.6 |
+| Bucket | Avg size | 1<br>P40 64K | 2<br>v2 64K | 3<br>v2+ 64K | 4<br>v1 4K | 6<br>v2 4K | 7<br>FileT | 8<br>Blob |
+|---|---|---|---|---|---|---|---|---|
+| Tiny | 0.03 MB | 0.7 | 1.7 | 1.8 | 0.8 | 1.4 | 0.7 | **3.0** |
+| Small | 0.53 MB | 10.1 | 24.7 | **25.8** | 12.9 | 21.5 | 9.9 | 23.6 |
+| Medium | 8.5 MB | 18.9 | 42.2 | **50.6** | 20.7 | 23.0 | 22.0 | 55.5 |
+| Large | 135 MB | 33.6 | 145.7 | **175.9** | 61.6 | 55.6 | 60.4 | 60.5 |
+| Huge | ~1 GB | 51.1 | **784.7** | 543.8 | 311.1 | 336.0 | 385.6 | 62.5 |
 
-Three things read straight off it:
+Four things read straight off it, and each is developed below:
 
-- **Run 2 pulls away as files grow, not as they shrink.** Tiny differs by 21%,
-  Huge by 134%. Whatever separates 64 KB from 4 KB here acts on bandwidth-bound
-  sequential writes, not on per-file metadata.
-- **FileTable crosses over inside the Medium band.** Below it, roughly half the
-  throughput of FILESTREAM; above it, slightly better.
-- **Every configuration is within a factor of 2.5 at Tiny and a factor of 2.3 at
-  Huge, but the absolute numbers differ by 500x between those two buckets.** File
-  size dominates every other variable measured.
+- **File size dominates every other variable.** Within any single run the spread
+  from Tiny to Huge is 70x to 460x. No disk change, no write path, and no
+  configuration setting in this report moves any number by more than about 4x.
+- **The small end barely responds to anything.** Tiny spans 0.7 to 3.0 MB/s
+  across eight runs, four disk configurations and four write paths. Storage
+  spend does not rescue a small-file workload.
+- **Azure Blob is flat, and everything else is not.** Blob sits at 55-63 MB/s
+  from Medium upward -- a per-connection ceiling -- while FILESTREAM climbs to
+  336-785. Blob still wins overall because that ceiling is per connection and
+  eight connections aggregate.
+- **The Huge row is noisy.** It holds 28 to 36 files per run. Run 2 against run
+  3 is the clearest case: 784.7 against 543.8 on a strictly faster disk. Do not
+  read that as a regression.
 
 ---
 
 ## Environment
+
+VM A, which carried runs 1 to 3. VM B (runs 4 to 7) was a rebuild at the same
+size on the same disks; VM C (run 8) is a third build, and the blob path it ran
+never touches a local disk. Only within-group comparisons are controlled.
 
 | | |
 |---|---|
 | VM | `Standard_E8ads_v5`, 8 vCPU, 63.9 GB RAM |
 | OS | Windows Server 2022 Datacenter, build **20348.5256** |
 | SQL Server | 2019, 15.0.4470.1, FILESTREAM effective level 2 |
-| `max server memory` | 56,000 MB for all three valid runs |
+| `max server memory` | 56,000 MB for runs 1 to 3 |
 
 Only the container disk changed between runs.
 
@@ -211,10 +220,12 @@ replaced.
 
 ---
 
-## Headline result
+## The disk progression: runs 1 to 3
 
-All three runs wrote exactly 200.00 GB. All used 8 threads, a 4 MB chunk size,
-the `Mixed` profile and `SIMPLE` recovery. All wrote into a new, empty container.
+The most controlled study in the report -- three runs on one machine where only
+the container disk changed. All wrote exactly 200.00 GB with 8 threads, a 4 MB
+chunk, the `Mixed` profile and `SIMPLE` recovery, into a new, empty container,
+at a 64 KB allocation unit.
 
 | | Run 1: P40 | Run 2: PremiumV2 | Run 3: PremiumV2 boosted |
 |---|---|---|---|
@@ -226,13 +237,19 @@ the `Mixed` profile and `SIMPLE` recovery. All wrote into a new, empty container
 | Errors | 2 commit timeouts | 0 | **0** |
 | Gain over previous | - | **2.63x** | **1.08x** |
 
-The kit randomises file sizes per run, so the file counts differ. All three runs
+The kit randomises file sizes per run, so the file counts differ. All three
 hit the 200.00 GB target exactly.
 
 **The returns collapse after run 2.** The first upgrade gave 2.63 times the
 throughput. The second gave 1.08 times, for a disk that measures 18% faster in a
 sequential test. The disk stopped limiting ingest at run 2. See
 [Where the bottleneck sits now](#where-the-bottleneck-sits-now).
+
+Runs 4 and 6 later repeated the v1-to-v2 step on a rebuilt machine at a 4 KB
+allocation unit and got **+28%** rather than +163%, at a far lower absolute
+level -- 134.7 to 172.4 MB/s against 104.4 to 274.5. Those two facts together
+are what
+[the unresolved 37% gap](#what-is-not-settled) is about.
 
 Results are in `C:\FsPocResults\run_20260910_152357_Filestream_Mixed`,
 `run_20260910_184032_Filestream_Mixed` and `run_20260910_192014_Filestream_Mixed`.
@@ -267,18 +284,10 @@ absorbing. In run 1 the client reported bursts of 425 MB/s while Perfmon showed
 
 ## Where the crossover is
 
-The kit measures this on the client, per file, from
-`FsPocMonitor.dbo.IngestTiming`. Effective MB/s per bucket:
+The per-bucket table is [above](#per-stream-throughput-by-file-size). This is
+what it means.
 
-| Bucket | Avg size | Run 1: P40 | Run 2: PremiumV2 | Run 3: boosted |
-|---|---|---|---|---|
-| Tiny | 0.03 MB | 0.7 | 1.7 | **1.8** |
-| Small | 0.53 MB | 10.1 | 24.7 | **25.8** |
-| Medium | about 8.5 MB | 18.9 | 42.2 | **50.6** |
-| Large | about 135 MB | 33.6 | 145.7 | **175.9** |
-| Huge | about 1,000 MB | 51.1 | 784.7 | **543.8** |
-
-Median latency per file:
+Median latency per file, the three 64 KB runs:
 
 | Bucket | Run 1: P40 | Run 2: PremiumV2 | Run 3: boosted |
 |---|---|---|---|
@@ -287,10 +296,6 @@ Median latency per file:
 | Medium | 242 ms | 25.4 ms | **46.3 ms** |
 | Large | 3,187 ms | 716 ms | **559 ms** |
 | Huge | 14,948 ms | 990 ms | **1,495 ms** |
-
-The Huge bucket holds 28 to 33 files per run. Its numbers move a lot between runs
-for that reason. Do not read the run 2 to run 3 change in that row as a
-regression. The sample is too small.
 
 The per-file cost breakdown on run 3:
 
@@ -302,18 +307,32 @@ The per-file cost breakdown on run 3:
 | Large | 145.77 | 192.02 | 441.87 |
 | Huge | 529.91 | 556.68 | 931.02 |
 
-Two findings hold on all three disks.
+Two findings held on all three disks, and both were later confirmed on a
+different machine, a different disk generation and a different allocation unit.
 
 **1. Per-file overhead dominates below about 1 MB.** On the P40 a Tiny file takes
-49 ms end to end, and only 14 ms of that is the write. On run 3 it takes 19 ms,
-and only 6.4 ms is the write. The proportion barely moves across a 2.8x range of
-disk speed. The rest is the `PathName()` round trip and the commit. At this size
-the fixed cost per file is the cost.
+49 ms end to end and only 14 ms of that is the write. On run 3 it takes 19 ms and
+only 6.4 ms is the write. The proportion barely moves across a 2.8x range of disk
+speed. Run 4 measured the same cost as a flat 40 ms -- a 33 KB file and a 533 KB
+file cost the same -- and run 6 brought it to 23 ms on faster storage without
+changing its shape. At this size the fixed cost per file *is* the cost.
 
-**2. The commit costs more than the write at every size.** On run 3 `AvgCommitMs`
-sits above `AvgWriteMs` in all five buckets. The commit is a durability flush.
-Batching more files per transaction is the obvious lever. The ingest does not
-support it today, because it uses one transaction per file.
+**2. The commit costs more than the write at every size.** True on all three
+disks in run 3's breakdown, and still true in run 4, where commit was **49.8% of
+all measured work**. Run 4 also established what that commit is not: `WRITELOG`
+accounted for only 9% of it. The rest is FILESTREAM finalising files.
+
+Two later runs put numbers on the alternatives to that commit:
+
+- **FileTable removes the transaction entirely** and got *slower*, because
+  per-file namespace resolution costs more than the commit it replaced
+  ([run 7](#run-7-filetable-on-premium-v2-the-clean-measurement)).
+- **Azure Blob replaces it with a single catalog row insert** costing a flat
+  3-5 ms regardless of size, 10% of that run's work
+  ([run 8](#run-8-azure-blob-storage-with-a-sql-server-catalog)).
+
+Batching multiple files per transaction remains the untested lever on the
+FILESTREAM path itself.
 
 ---
 
@@ -343,14 +362,37 @@ use it, because it waits on per-file work instead.
 first upgrade helped it a little. The second did not help it at all. The spread
 from Tiny to Huge is now about 300 times.
 
+**Runs 4 to 6 found where the disk still mattered: IOPS, not bandwidth.** On the
+rebuilt machine, Premium v1 to v2 gained 28%, and **95% of the saved time came
+from files under 1 MB** while Large got 10% slower.
+`PREEMPTIVE_OS_CREATEFILE` improved most at -31% -- NTFS metadata work, four
+calls per file, and metadata is IOPS-bound. So the conclusion above needs one
+qualification: the disk had stopped being a *bandwidth* constraint at run 2. It
+had not stopped being an IOPS constraint.
+
+**And the ceiling has moved off the disk entirely.**
+`FILESTREAM_WORKITEM_QUEUE` -- the FILESTREAM agent serialising file operations,
+not a disk wait -- fell 22% in absolute terms from run 4 to run 6 but **grew
+from 40.5% to 42.7% of all wait time**. As storage improves it becomes a larger
+share of what remains. A further disk upgrade should be expected to return less
+than the last one did.
+
 > If the workload is small files, faster storage does not rescue it. The per-file
 > cost is the `PathName()` round trip plus the commit. Neither is a throughput
 > problem. Storage spend helps the large end. It helps the small end barely at
 > all, and it stops helping anything once the disk clears the workload.
 
-**The A/B against in-table `varbinary(max)` has not run yet.** These numbers
-describe the cost curve of FILESTREAM. They do not tell you whether FILESTREAM is
-the right choice. This is the most important open item. See
+**Three alternatives have since been measured against it**, which the earlier
+version of this section could not do:
+
+| Path | Throughput | Against FILESTREAM on the same machine |
+|---|---|---|
+| FILESTREAM (run 6) | 172.4 MB/s | baseline |
+| FileTable (run 7) | 120.0 MB/s | **-30%**, all of it small files |
+| Azure Blob (run 8) | 309.2 MB/s | **+79%**, on a different VM |
+
+In-table `varbinary(max)` remains the one comparison never run, and it is the
+one most applications actually face below 1 MB. See
 [Not yet done](#not-yet-done).
 
 ---
@@ -359,29 +401,55 @@ the right choice. This is the most important open item. See
 
 From `sys.dm_os_wait_stats` deltas over each run. Total wait time in seconds:
 
-| Wait | Run 1 | Run 2 | Run 3 | Run 3 avg ms |
-|---|---|---|---|---|
-| `FILESTREAM_WORKITEM_QUEUE` | 10,063 | 4,110 | 3,733 | 4.46 |
-| `PREEMPTIVE_OS_FILEOPS` | 5,445 | 2,253 | 1,911 | 11.77 |
-| `PREEMPTIVE_OS_CREATEFILE` | 3,785 | 1,753 | 1,580 | 2.44 |
-| `PREEMPTIVE_OS_DELETEFILE` | 625 | 464 | 415 | 0.86 |
-| `WRITELOG` | 328 | 197 | 291 | 1.77 |
+| Wait | 1 | 2 | 3 | 4 | 6 | 7 FileT | 8 Blob |
+|---|---|---|---|---|---|---|---|
+| `FILESTREAM_WORKITEM_QUEUE` | 10,063 | 4,110 | 3,733 | 8,069 | 6,334 | - | - |
+| `PREEMPTIVE_OS_FILEOPS` | 5,445 | 2,253 | 1,911 | 4,775 | 3,601 | 1,887 | - |
+| `PREEMPTIVE_OS_CREATEFILE` | 3,785 | 1,753 | 1,580 | 4,015 | 2,786 | 1,755 | - |
+| `PREEMPTIVE_OS_DELETEFILE` | 625 | 464 | 415 | 762 | 483 | 72 | - |
+| `FFT_NSO_FCB_FIND` | - | - | - | - | - | **1,532** | - |
+| `FFT_NSO_FCB_PARENT` | - | - | - | - | - | **1,414** | - |
+| `WRITELOG` | 328 | 197 | 291 | 488 | 428 | 1,188 | **448** |
 
-The `PREEMPTIVE_OS_*` family takes about 43% of wait time on all three runs.
-Standard "top waits" scripts filter that family out as idle noise. That is why
-FILESTREAM investigations so often come back empty-handed.
+The `PREEMPTIVE_OS_*` family takes about 43% of wait time on runs 1 to 3 and
+stays dominant through runs 4 and 6. Standard "top waits" scripts filter that
+family out as idle noise. That is why FILESTREAM investigations so often come
+back empty-handed.
 
-**Container churn is much higher than the file count suggests.** It is a property
-of FILESTREAM, not of the storage. Run 3 stored 162,143 files and issued 648,572
-`CREATEFILE` waits. That is about 4 creates per stored file. Run 1 issued 647,336
-waits for 161,832 files, and run 2 issued 648,204 for 162,051. The ratio holds
-across three disk configurations.
+`FILESTREAM_WORKITEM_QUEUE` was missing from earlier versions of this table for
+a different reason: the analysis classified it as "Other", because the pattern
+`FS[_]%` requires a literal underscore and nothing beginning `FILESTREAM` ever
+matched it. It is the single largest wait on every FILESTREAM run.
+
+**Container churn is much higher than the file count suggests.** A property of
+FILESTREAM, not of the storage, and it holds across every disk configuration and
+both allocation units:
+
+| Run | Files | `CREATEFILE` waits | Per file |
+|---|---|---|---|
+| 1 | 161,832 | 647,336 | 4.00 |
+| 2 | 162,051 | 648,204 | 4.00 |
+| 3 | 162,143 | 648,572 | 4.00 |
+| 4 | 161,675 | 646,700 | 4.00 |
+| 6 | 162,124 | 648,520 | 4.00 |
+| 7 (FileTable) | 161,804 | 485,526 | 3.00 |
+
+Exactly four, five times, on three disk generations and two allocation units.
+FileTable pays exactly three. Neither number has been explained -- the Procmon
+traces that would explain them are captured but not yet analysed.
+
+**The two paths that avoid FILESTREAM look completely different.** Run 7
+replaces the FILESTREAM waits with FileTable's own namespace resolution,
+`FFT_NSO_FCB_*`, at 30.7% of its wait time. Run 8 has essentially no waits at
+all: `WRITELOG` is **99.35%** of the total and nothing else reaches 0.3%,
+because the only thing SQL Server does in that run is log 161,981 catalog rows.
 
 ---
 
-## Container disk behaviour
+## Container disk behaviour (runs 1 to 3)
 
-Perfmon, `H:` only, over each run:
+Perfmon, `H:` only. Later runs collected Perfmon but these figures have not been
+extracted from them, so this section stays scoped to the three-disk study.
 
 | Metric | Run 1: P40 | Run 2: PremiumV2 | Run 3: boosted |
 |---|---|---|---|
@@ -428,6 +496,18 @@ both run 2 and run 3, and the drop time still fell by 19 times.
 8% from the same hardware change, and container deletion gained 1,800%. The two
 workloads need different things from the same disk.
 
+A later teardown on VM B put a harder number on the worst case. Dropping a
+container holding **323,689 files across 400 GB** -- two runs' output, since
+nobody had reset between them -- ran past a **900 second timeout** with nothing
+blocking it. `DROP DATABASE` deletes the container synchronously inside the
+statement, so the whole cost lands in one uninterruptible call with no progress
+reporting.
+
+The fix is procedural rather than hardware: take the database **offline first**,
+which makes the `DROP` a metadata operation, then remove the directory from the
+file system where `rd /s /q` is markedly faster and progress is visible. That is
+what `Reset-FilestreamPoc.ps1` now does.
+
 ---
 
 ## Configuration findings
@@ -436,7 +516,7 @@ workloads need different things from the same disk.
 pool can take everything, which starves the Windows system file cache. This
 matters more for FILESTREAM than for a normal workload. FILESTREAM I/O never uses
 the buffer pool, because the blobs never pass through it. No SQL-side counter
-shows this. The value is capped at 56,000 MB for all three valid runs.
+shows this. The value is capped at 56,000 MB for runs 1 to 3.
 
 **The container disk was the weakest disk on the box. It no longer is.** It was a
 P40 `Premium_LRS` at about 250 MB/s, while `F:` and `G:` were `PremiumV2_LRS`.
@@ -451,6 +531,19 @@ you treat a PremiumV2 disk as an upgrade.
 caring about the disk once it clears about 475 MB/s. Container deletion keeps
 caring well past that point, and it is the longest step in a clean-run cycle when
 IOPS run short.
+
+**Allocation unit is the largest unresolved variable.** Runs 1 to 3 used 64 KB;
+runs 4 to 7 used 4 KB. Premium v2 returned 274.5 MB/s at 64 KB and 172.4 MB/s at
+4 KB on the same disk at the same VM size. The per-bucket data points at
+provisioned bandwidth rather than cluster size, but neither is proven. See
+[What is not settled](#what-is-not-settled).
+
+**Managed identity needs a data-plane role, and the portal will not tell you.**
+For the Azure Blob path the VM identity requires `Storage Blob Data Contributor`.
+`Owner` and `Contributor` are control-plane roles and grant no blob access at
+all, which produces a 403 on every upload while the identity appears fully
+privileged. The kit's preflight now issues one container list request before a
+run starts, so this fails in a second rather than 161,000 times.
 
 **Ruled out as factors in these numbers:** Defender (excluded), 8.3 name
 generation (off on `H:`), volume roles (verified against the instance default
