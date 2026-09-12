@@ -1,14 +1,79 @@
 # FILESTREAM POC - performance findings
 
-Run date: 2026-09-10. Target VM: `SQL1` (Azure, eastus).
+Azure SQL Server 2019 VMs, `Mixed` size profile, 8 threads, 4 MB chunk,
+`SIMPLE` recovery, 200 GB per run. Ingest only; the read path is not yet
+measured.
 
-Six 200 GB ingest runs took place. Three gave valid results. Each valid run used
-a different container disk configuration. This report compares them. It covers
-ingest performance only.
+---
 
-Two results matter most. The disk stops being the bottleneck after the first
-upgrade, so the second upgrade buys almost nothing for ingest. Container deletion
-behaves in the opposite way, and it needs IOPS more than it needs bandwidth.
+## Summary
+
+| # | Configuration | Alloc | VM | Container | Files | Elapsed | MB/s | Files/s | P95 | Errors |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | P40 (Premium v1) | 64 KB | A | empty | 161,834 | 32m 38s | 104.4 | 82.7 | - | 2 commit timeouts |
+| 2 | Premium v2 | 64 KB | A | empty | 162,051 | 12m 26s | **274.5** | 217.2 | - | 0 |
+| 3 | Premium v2, more IOPS | 64 KB | A | empty | 162,143 | **11m 32s** | **296.0** | **234.4** | - | 0 |
+| 4 | Premium v1 | 4 KB | B | empty | 161,675 | 25m 19s | 134.7 | 106.4 | 64.8 ms | 0 |
+| 5 | **FileTable**, Premium v1 | 4 KB | B | **not empty** | 162,014 | 33m 58s | 100.5 | 79.5 | 228.0 ms | 0 client / **219 lock timeouts** |
+| 6 | Premium v2 | 4 KB | B | empty | 162,124 | 19m 46s | 172.4 | 136.7 | **41.7 ms** | 0 |
+| - | ~~Premium v1~~ | 64 KB | A | empty | - | 23m 28s | ~~144.9~~ | - | - | **INVALID** |
+
+All runs are `Filestream` (transacted `SqlFileStream`) except run 5.
+**VM A** = `Standard_E8ads_v5`, OS 20348.5256. **VM B** = rebuilt, same SQL
+build. Cross-VM rows are not controlled comparisons.
+
+The invalid row is kept deliberately: the machine went down 25 seconds after
+that run "completed" and the data was still in the Windows file cache, so the
+disk never absorbed it. See
+[Do not quote the 144.9 MB/s figure](#do-not-quote-the-1449-mbs-figure).
+
+### What the numbers say
+
+**FILESTREAM ingest is IOPS-bound, not bandwidth-bound.** Run 4 to 6 gave +28%
+from provisioned IOPS, and **95% of the saved time came from files under 1 MB**.
+Large files got 10% *slower*. Earlier, an 18% faster disk bought only 8% more
+throughput. Bandwidth stopped mattering; per-operation cost did not.
+
+**Small files are the workload.** In run 4, files averaging 33 KB were 2% of the
+bytes and **46% of the elapsed time**. Per thread that is 0.84 MB/s against
+77 MB/s for the large buckets -- a 92x difference inside one run on one disk.
+The cost is per file and roughly flat: a 33 KB file and a 533 KB file cost the
+same.
+
+**The transaction log is never the constraint.** 1.4 GB of log for 200 GB of
+data, `WRITELOG` under 3% of wait time at a 2.6 ms mean, in every run. Moving or
+upgrading the log disk will not help this workload.
+
+**The ceiling is moving off the disk.** `FILESTREAM_WORKITEM_QUEUE` -- the
+FILESTREAM agent serialising file operations, not a disk wait -- fell 22% in
+absolute terms from run 4 to run 6 but **grew from 40.5% to 42.7% of all wait
+time**. Expect a further disk upgrade to return less than this one did.
+
+**Four `CreateFile` calls per file written**, identical on both SKUs. Structural,
+and the second largest wait.
+
+**Client-reported throughput can outrun the disk.** One run reported 144.9 MB/s
+for writes still sitting in the Windows file cache. FILESTREAM writes bypass the
+SQL Server buffer pool and go through that cache, so client numbers need a
+Perfmon cross-check before anyone quotes them.
+
+### What is not settled
+
+**Allocation unit may be the largest lever found, and it is unmeasured.**
+Premium v2 returned 274.5 MB/s at 64 KB (run 2) and 172.4 MB/s at 4 KB (run 6) --
+a 37% difference. But the VM was rebuilt between them and the disk's provisioned
+IOPS and throughput are not known to match, so **two or more variables changed
+and allocation unit cannot be credited**. A 64 KB run on VM B would settle it,
+and if allocation unit is responsible it outweighs every other tuning decision
+in this report.
+
+**FileTable has no clean measurement.** Run 5 went into a container already
+holding 200 GB, and a populated container costs roughly 2x per-file throughput.
+Its 34% deficit is an upper bound, not a result. The lock timeouts stand
+regardless.
+
+**Not attempted:** the read path, `FULL` recovery, `-FileTableFlush`, and
+multiple FILESTREAM containers across disks.
 
 ---
 
