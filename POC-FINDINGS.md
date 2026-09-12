@@ -19,8 +19,10 @@ measured.
 | - | ~~Premium v1~~ | 64 KB | A | empty | - | 23m 28s | ~~144.9~~ | - | - | **INVALID** |
 
 All runs are `Filestream` (transacted `SqlFileStream`) except run 5.
-**VM A** = `Standard_E8ads_v5`, OS 20348.5256. **VM B** = rebuilt, same SQL
-build. Cross-VM rows are not controlled comparisons.
+**VM A** = `Standard_E8ads_v5`, OS 20348.5256. **VM B** = a rebuild at the same
+VM size, on the same disks, same SQL build. Runs 4-6 were traced with Procmon;
+whether runs 1-3 were is not recorded, because `ProcmonActive` was stored as 0
+on every run until that bug was fixed.
 
 The invalid row is kept deliberately: the machine went down 25 seconds after
 that run "completed" and the data was still in the Windows file cache, so the
@@ -59,13 +61,29 @@ Perfmon cross-check before anyone quotes them.
 
 ### What is not settled
 
-**Allocation unit may be the largest lever found, and it is unmeasured.**
-Premium v2 returned 274.5 MB/s at 64 KB (run 2) and 172.4 MB/s at 4 KB (run 6) --
-a 37% difference. But the VM was rebuilt between them and the disk's provisioned
-IOPS and throughput are not known to match, so **two or more variables changed
-and allocation unit cannot be credited**. A 64 KB run on VM B would settle it,
-and if allocation unit is responsible it outweighs every other tuning decision
-in this report.
+**A 37% gap that nothing in this report explains.** Premium v2 returned
+274.5 MB/s at a 64 KB allocation unit (run 2) and 172.4 MB/s at 4 KB (run 6).
+The disk and the VM size were the same. That leaves allocation unit as the
+leading candidate for a 37% difference -- larger than the v1-to-v2 upgrade this
+report spent three runs measuring.
+
+It is not yet safe to credit, for two reasons:
+
+1. **The v1 pair points the other way.** Run 1 (64 KB) managed 104.4 MB/s while
+   run 4 (4 KB) managed 134.7 MB/s -- 4 KB *faster* by 29%. Run 1 also used
+   `ReadOnly` host caching, which this report elsewhere finds never helps
+   writes, so that comparison is not clean either. But two allocation-unit
+   comparisons disagreeing in direction means neither is a measurement.
+2. **Run 6 ran with Procmon active; whether runs 2 and 3 did is not recorded.**
+   `ProcmonActive` was silently stored as 0 on every run until the bug was
+   fixed, so the flag cannot answer this retrospectively. Tracing is windowed
+   to 120s of a ~1,200s run, so it should account for a few percent at most --
+   nowhere near 37% -- but it is a known uncontrolled difference.
+
+A 64 KB run on the current VM settles it, and it is one reformat plus one run.
+Given the size of the gap that is the highest-value remaining measurement in
+this report -- ahead of the FileTable work, because a 37% configuration lever
+matters more than sizing FileTable's deficit.
 
 **FileTable has no clean measurement.** Run 5 went into a container already
 holding 200 GB, and a populated container costs roughly 2x per-file throughput.
