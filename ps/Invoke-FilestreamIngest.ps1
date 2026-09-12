@@ -28,7 +28,8 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Filestream', 'Blob', 'FileTable', 'FilestreamRead', 'BlobRead', 'FileTableRead')]
+    [ValidateSet('Filestream', 'Blob', 'FileTable', 'AzureBlob',
+                 'FilestreamRead', 'BlobRead', 'FileTableRead', 'AzureBlobRead')]
     [string] $Scenario = 'Filestream',
 
     [double] $TargetGB,
@@ -148,6 +149,87 @@ if ($SourcePath) {
     Write-FsPocLog ("Found {0:N0} files, {1}" -f $sourceFiles.Count, (Format-FsPocBytes $srcBytes)) 'OK'
 }
 
+# --- Azure Blob: resolve the endpoint and credential -----------------------
+$blobBaseUrl = ''
+$blobSas     = ''
+$blobAuth    = 'ManagedIdentity'
+$blobMiId    = ''
+$blobUrls    = @()
+
+if ($Scenario -like 'AzureBlob*') {
+    foreach ($k in 'BlobAccount', 'BlobContainer', 'BlobEndpoint') {
+        if ([string]::IsNullOrWhiteSpace([string]$cfg.$k)) { throw "$k is not set in $ConfigPath." }
+    }
+    $blobBaseUrl = "https://$($cfg.BlobAccount).$($cfg.BlobEndpoint)/$($cfg.BlobContainer)"
+    $blobAuth    = if ($cfg.PSObject.Properties['BlobAuth']) { [string]$cfg.BlobAuth } else { 'ManagedIdentity' }
+    $blobMiId    = if ($cfg.PSObject.Properties['BlobManagedIdentityClientId']) { [string]$cfg.BlobManagedIdentityClientId } else { '' }
+
+    # Azure Storage refuses anything below TLS 1.2, and .NET Framework's default
+    # protocol list predates it -- without this every request fails with a
+    # connection error that never mentions TLS.
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+    $probeHeaders = @{ 'x-ms-version' = '2021-08-06' }
+    $probeQuery   = 'restype=container&comp=list&maxresults=1'
+
+    if ($blobAuth -eq 'ManagedIdentity') {
+        $tokUri = 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fstorage.azure.com%2F'
+        if ($blobMiId) { $tokUri += "&client_id=$blobMiId" }
+        try {
+            $tok = Invoke-RestMethod -Uri $tokUri -Headers @{ Metadata = 'true' } -TimeoutSec 30
+        }
+        catch {
+            throw "Could not get a managed identity token from IMDS: $($_.Exception.Message)`nIs a managed identity assigned to this VM? Set BlobAuth = 'Sas' in $ConfigPath to use a SAS token instead."
+        }
+        $probeHeaders['Authorization'] = "Bearer $($tok.access_token)"
+        Write-FsPocLog "Managed identity token acquired (expires $([DateTimeOffset]::FromUnixTimeSeconds([long]$tok.expires_on).UtcDateTime.ToString('u')))." 'OK'
+    }
+    else {
+        $blobSas = [string]$env:FSPOC_BLOB_SAS
+        if ([string]::IsNullOrWhiteSpace($blobSas)) { $blobSas = [string]$cfg.BlobSasToken }
+        $blobSas = $blobSas.TrimStart('?')
+        if ([string]::IsNullOrWhiteSpace($blobSas)) {
+            throw "BlobAuth is 'Sas' but no token was found. Set FSPOC_BLOB_SAS or BlobSasToken in $ConfigPath."
+        }
+        $probeQuery += "&$blobSas"
+    }
+
+    Write-FsPocLog "Blob container: $blobBaseUrl  (auth: $blobAuth)" 'OK'
+
+    <#  Fail on the container, not on the 161,000th file.
+
+        A missing container, an expired SAS, a firewall rule, or -- the common
+        one with managed identity -- a control-plane role like Owner that
+        carries no blob DATA permission, all produce the same symptom deep in a
+        run: every upload failing identically, 40 minutes late. One list request
+        settles it in a second.
+    #>
+    try {
+        $null = Invoke-WebRequest -Uri "$blobBaseUrl`?$probeQuery" -Method GET -Headers $probeHeaders `
+                    -UseBasicParsing -TimeoutSec 30
+        Write-FsPocLog 'Container reachable and readable.' 'OK'
+    }
+    catch {
+        $code = try { [int]$_.Exception.Response.StatusCode } catch { 0 }
+        $hint = switch ($code) {
+            403 { "403 Forbidden. With managed identity this almost always means the identity has no DATA-plane role. Owner and Contributor do not grant blob access -- assign 'Storage Blob Data Contributor' on the account or container." }
+            404 { "404 Not Found. Container '$($cfg.BlobContainer)' does not exist on account '$($cfg.BlobAccount)'." }
+            default { $_.Exception.Message }
+        }
+        throw "Cannot reach $blobBaseUrl : $hint"
+    }
+}
+
+if ($Scenario -eq 'AzureBlobRead') {
+    $srcRun = if ($PSBoundParameters.ContainsKey('SourceRunId')) { $SourceRunId } else { $null }
+    $bu = Invoke-FsPocSql -Instance $cfg.SqlInstance -Database $cfg.DemoDb `
+            -Query 'EXEC dbo.usp_GetBlobUrlSample @RunId, @Top' -Parameters @{ RunId = $srcRun; Top = 500000 }
+    $blobUrls = @($bu.Rows | ForEach-Object {
+        [pscustomobject]@{ Url = [string]$_.BlobUrl; SizeBytes = [long]$_.SizeBytes; Bucket = [string]$_.Bucket } })
+    if ($blobUrls.Count -eq 0) { throw 'dbo.BlobUrlStore holds no rows. Run an AzureBlob ingest first.' }
+    Write-FsPocLog ("Blob read source: {0:N0} catalogued blob(s)" -f $blobUrls.Count) 'OK'
+}
+
 # --- FileTable: resolve the share root, or the file list for a read run ----
 $fileTableRoot  = ''
 $fileTablePaths = @()
@@ -241,7 +323,12 @@ $worker = {
         [long]     $ReadOpCount,
         [string]   $FileTableRoot,
         [bool]     $FileTableFlush,
-        [object[]] $FileTablePaths
+        [object[]] $FileTablePaths,
+        [string]   $BlobBaseUrl,
+        [string]   $BlobSas,
+        [object[]] $BlobUrls,
+        [string]   $BlobAuth,
+        [string]   $BlobMiClientId
     )
 
     $ErrorActionPreference = 'Stop'
@@ -282,13 +369,51 @@ $worker = {
     # this worker has already made so it is done once, not once per file.
     $createdDirs = New-Object 'System.Collections.Generic.HashSet[string]'
 
+    <#  One HttpClient per worker, for the AzureBlob scenarios.
+
+        Two settings that are not optional on Windows PowerShell 5.1:
+
+        TLS 1.2 -- .NET Framework's default protocol list predates it, and Azure
+        Storage refuses anything older, so without this every request fails with
+        a connection error that says nothing about TLS.
+
+        DefaultConnectionLimit -- defaults to 2 per endpoint. Eight workers would
+        silently queue behind two connections and the run would report the
+        concurrency it was given rather than the concurrency it had.
+    #>
+    $http = $null
+    if ($Scenario -like 'AzureBlob*') {
+        Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        [Net.ServicePointManager]::DefaultConnectionLimit = 256
+        [Net.ServicePointManager]::Expect100Continue = $false
+        $http = New-Object System.Net.Http.HttpClient
+        $http.Timeout = [TimeSpan]::FromMinutes(15)
+        $null = $http.DefaultRequestHeaders.TryAddWithoutValidation('x-ms-version', '2021-08-06')
+    }
+    # Managed identity tokens last hours, but a long run can outlive one. Each
+    # worker holds its own and refreshes inline; IMDS is link-local so the call
+    # is cheap. Refreshed BEFORE expiry, never in response to a 401, so no file
+    # pays for the rotation with a failed upload.
+    $blobToken    = ''
+    $blobTokenExp = [DateTime]::MinValue
+    # Query-string fragments: empty under managed identity, the SAS otherwise.
+    $sasFirst = if ($BlobAuth -eq 'Sas' -and $BlobSas) { "?$BlobSas" } else { '' }
+    $sasMore  = if ($BlobAuth -eq 'Sas' -and $BlobSas) { "&$BlobSas" } else { '' }
+
     try {
         # -------------------------------------------------------------------
         # Build this worker's list of work items
         # -------------------------------------------------------------------
         $items = New-Object System.Collections.Generic.List[object]
 
-        if ($Scenario -eq 'FileTableRead') {
+        if ($Scenario -eq 'AzureBlobRead') {
+            for ($i = $WorkerId; $i -lt $BlobUrls.Count; $i += $Control['Threads']) {
+                $b = $BlobUrls[$i]
+                $items.Add([pscustomobject]@{ Bucket = $b.Bucket; FileId = [long]0; SizeBytes = [long]$b.SizeBytes; Path = [string]$b.Url })
+            }
+        }
+        elseif ($Scenario -eq 'FileTableRead') {
             # Stripe the real path list across workers.
             for ($i = $WorkerId; $i -lt $FileTablePaths.Count; $i += $Control['Threads']) {
                 $f = $FileTablePaths[$i]
@@ -464,6 +589,138 @@ $worker = {
                         $commitMs = $sw.Elapsed.TotalMilliseconds
                         $tx.Dispose(); $tx = $null
                         $me['Bytes'] += $size
+                    }
+
+                    # ---------------- AZURE BLOB WRITE ----------------------
+                    # Upload the bytes to Azure, then record a row in SQL Server
+                    # pointing at them. Upload FIRST: a failure then leaves an
+                    # orphan blob rather than a row referencing a blob that does
+                    # not exist. The two cannot share a transaction.
+                    'AzureBlob' {
+                        $size = $item.SizeBytes
+                        $name = "$($item.Bucket)/w$WorkerId/$([guid]::NewGuid().ToString('N')).bin"
+                        $blobUrl = "$BlobBaseUrl/$name"
+                        $etag = $null
+
+                        if ($BlobAuth -eq 'ManagedIdentity' -and $blobTokenExp -lt [DateTime]::UtcNow.AddMinutes(5)) {
+                            $stage = 'IMDS token'
+                            $tokUri = 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fstorage.azure.com%2F'
+                            if ($BlobMiClientId) { $tokUri += "&client_id=$BlobMiClientId" }
+                            $tr = Invoke-RestMethod -Uri $tokUri -Headers @{ Metadata = 'true' } -TimeoutSec 30
+                            $blobToken    = [string]$tr.access_token
+                            $blobTokenExp = [DateTimeOffset]::FromUnixTimeSeconds([long]$tr.expires_on).UtcDateTime
+                            $http.DefaultRequestHeaders.Authorization =
+                                New-Object System.Net.Http.Headers.AuthenticationHeaderValue('Bearer', $blobToken)
+                        }
+
+                        $sw.Restart()
+                        try {
+                            if ($size -le [long]$ChunkBytes) {
+                                # Single-shot Put Blob: what any client does below
+                                # the chunk size, and one round trip instead of two.
+                                $stage = 'blob PUT (single)'
+                                $off = $rand.Next(0, $Pool.Length - [int]$size)
+                                $body = New-Object System.Net.Http.ByteArrayContent($Pool, $off, [int]$size)
+                                $null = $body.Headers.TryAddWithoutValidation('x-ms-blob-type', 'BlockBlob')
+                                $resp = $http.PutAsync("$blobUrl$sasFirst", $body).GetAwaiter().GetResult()
+                                try {
+                                    if (-not $resp.IsSuccessStatusCode) { throw "PUT $([int]$resp.StatusCode) $($resp.ReasonPhrase)" }
+                                    if ($resp.Headers.ETag) { $etag = $resp.Headers.ETag.Tag }
+                                }
+                                finally { $resp.Dispose(); $body.Dispose() }
+                            }
+                            else {
+                                # Put Block xN then Put Block List. Block ids must be
+                                # base64 and the SAME length across a blob, hence D6.
+                                $stage = 'blob PUT (blocks)'
+                                $ids = New-Object System.Collections.Generic.List[string]
+                                $remaining = $size
+                                $bi = 0
+                                while ($remaining -gt 0) {
+                                    $n   = [int][Math]::Min([long]$ChunkBytes, $remaining)
+                                    $off = $rand.Next(0, $Pool.Length - $n)
+                                    $id  = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($bi.ToString('D6')))
+                                    $ids.Add($id)
+                                    $u = "$blobUrl`?comp=block&blockid=$([Uri]::EscapeDataString($id))$sasMore"
+                                    $body = New-Object System.Net.Http.ByteArrayContent($Pool, $off, $n)
+                                    $resp = $http.PutAsync($u, $body).GetAwaiter().GetResult()
+                                    try {
+                                        if (-not $resp.IsSuccessStatusCode) { throw "Put Block $bi -> $([int]$resp.StatusCode) $($resp.ReasonPhrase)" }
+                                    }
+                                    finally { $resp.Dispose(); $body.Dispose() }
+                                    $remaining -= $n; $bi++
+                                }
+
+                                $stage = 'blob commit block list'
+                                $sb = New-Object System.Text.StringBuilder
+                                $null = $sb.Append('<?xml version="1.0" encoding="utf-8"?><BlockList>')
+                                foreach ($id in $ids) { $null = $sb.Append('<Latest>').Append($id).Append('</Latest>') }
+                                $null = $sb.Append('</BlockList>')
+                                $body = New-Object System.Net.Http.StringContent($sb.ToString(), [Text.Encoding]::UTF8, 'application/xml')
+                                $resp = $http.PutAsync("$blobUrl`?comp=blocklist$sasMore", $body).GetAwaiter().GetResult()
+                                try {
+                                    if (-not $resp.IsSuccessStatusCode) { throw "Put Block List -> $([int]$resp.StatusCode) $($resp.ReasonPhrase)" }
+                                    if ($resp.Headers.ETag) { $etag = $resp.Headers.ETag.Tag }
+                                }
+                                finally { $resp.Dispose(); $body.Dispose() }
+                            }
+                        }
+                        finally { $sw.Stop(); $writeMs = $sw.Elapsed.TotalMilliseconds }
+
+                        # The catalog write. Timed as commit, because it is the
+                        # durable metadata write this path pays in place of the
+                        # other three paths' transaction commit.
+                        $sw.Restart()
+                        $stage = 'SQL catalog insert'
+                        $cmd = $conn.CreateCommand()
+                        $cmd.CommandType = [System.Data.CommandType]::StoredProcedure
+                        $cmd.CommandText = 'dbo.usp_InsertBlobUrl'
+                        $cmd.CommandTimeout = 0
+                        $null = $cmd.Parameters.AddWithValue('@RunId',     $RunId)
+                        $null = $cmd.Parameters.AddWithValue('@Bucket',    $item.Bucket)
+                        $null = $cmd.Parameters.AddWithValue('@FileName',  $name)
+                        $null = $cmd.Parameters.AddWithValue('@SizeBytes', $size)
+                        $null = $cmd.Parameters.AddWithValue('@BlobUrl',   $blobUrl)
+                        $null = $cmd.Parameters.AddWithValue('@ETag',      $(if ($etag) { $etag } else { [DBNull]::Value }))
+                        $null = $cmd.ExecuteNonQuery()
+                        $sw.Stop(); $commitMs = $sw.Elapsed.TotalMilliseconds
+
+                        $me['Bytes'] += $size
+                    }
+
+                    # ---------------- AZURE BLOB READ -----------------------
+                    # Catalog lookup already happened in bulk; this is the fetch.
+                    'AzureBlobRead' {
+                        if ($BlobAuth -eq 'ManagedIdentity' -and $blobTokenExp -lt [DateTime]::UtcNow.AddMinutes(5)) {
+                            $stage = 'IMDS token'
+                            $tokUri = 'http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fstorage.azure.com%2F'
+                            if ($BlobMiClientId) { $tokUri += "&client_id=$BlobMiClientId" }
+                            $tr = Invoke-RestMethod -Uri $tokUri -Headers @{ Metadata = 'true' } -TimeoutSec 30
+                            $blobToken    = [string]$tr.access_token
+                            $blobTokenExp = [DateTimeOffset]::FromUnixTimeSeconds([long]$tr.expires_on).UtcDateTime
+                            $http.DefaultRequestHeaders.Authorization =
+                                New-Object System.Net.Http.Headers.AuthenticationHeaderValue('Bearer', $blobToken)
+                        }
+                        $sw.Restart()
+                        $stage = 'blob GET'
+                        $read = [long]0
+                        $resp = $http.GetAsync("$($item.Path)$sasFirst",
+                                    [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+                        try {
+                            if (-not $resp.IsSuccessStatusCode) { throw "GET $([int]$resp.StatusCode) $($resp.ReasonPhrase)" }
+                            $stream = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+                            try { while (($n = $stream.Read($chunkBuf, 0, $chunkBuf.Length)) -gt 0) { $read += $n } }
+                            finally { $stream.Dispose() }
+                        }
+                        finally { $resp.Dispose() }
+                        $sw.Stop(); $writeMs = $sw.Elapsed.TotalMilliseconds
+
+                        if ($item.SizeBytes -gt 0 -and $read -ne $item.SizeBytes) {
+                            $me['Errors']++
+                            $me['LastError'] = "Short read on $($item.Path): $read of $($item.SizeBytes)"
+                        }
+                        $item.SizeBytes = $read
+                        $me['Bytes'] += $read
                     }
 
                     # ---------------- FILETABLE WRITE -----------------------
@@ -655,6 +912,10 @@ $worker = {
                 #>
                 $chain = "$($ex.Message) $inner"
                 $isTransient =
+                    ($chain -match 'PUT 50[0-9]') -or ($chain -match 'GET 50[0-9]') -or
+                    ($chain -match 'Put Block.*-> 50[0-9]') -or
+                    ($chain -match 'ServerBusy') -or ($chain -match 'OperationTimedOut') -or
+                    ($chain -match 'task was canceled') -or
                     ($conn.State -ne [System.Data.ConnectionState]::Open) -or
                     ($chain -match 'Execution Timeout Expired') -or
                     ($chain -match 'connection is closed') -or
@@ -690,6 +951,7 @@ $worker = {
         $me['Done'] = $true
         try { $csv.Flush(); $csv.Close(); $csv.Dispose() } catch { }
         try { $conn.Close(); $conn.Dispose() } catch { }
+        if ($http) { try { $http.Dispose() } catch { } }
     }
 }
 
@@ -732,7 +994,12 @@ foreach ($w in 0..($cfg.Threads - 1)) {
         AddArgument([long]$readOpsPerWorker).
         AddArgument([string]$fileTableRoot).
         AddArgument([bool]$FileTableFlush).
-        AddArgument($fileTablePaths)
+        AddArgument($fileTablePaths).
+        AddArgument([string]$blobBaseUrl).
+        AddArgument([string]$blobSas).
+        AddArgument($blobUrls).
+        AddArgument([string]$blobAuth).
+        AddArgument([string]$blobMiId)
     $jobs += [pscustomobject]@{ Id = $w; Shell = $ps; Handle = $ps.BeginInvoke() }
 }
 

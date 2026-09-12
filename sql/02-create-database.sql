@@ -399,3 +399,108 @@ PRINT 'FileTable share root:';
 GO
 EXEC dbo.usp_GetFileTableRoot;
 GO
+
+/* ---------------------------------------------------------------------------
+   Azure Blob Storage: the fourth write path.
+
+   The pattern here is SQL Server as CATALOG, blob storage as STORE. The client
+   uploads the bytes to Azure and then records a row pointing at them. That is
+   the architecture most teams actually weigh against FILESTREAM, and it is the
+   only one of the four paths where the bytes never touch the database server.
+
+   What it gives up is stated plainly, because it does not show up in a
+   throughput number:
+
+     * No atomicity. The upload and the row are two systems and cannot share a
+       transaction. This kit uploads first and inserts second, so a failure
+       never leaves a row pointing at a blob that is not there -- it leaves an
+       orphan blob instead, which is the safer of the two failures and still
+       needs a reconciliation job nobody has written.
+     * No backup coherence. BACKUP DATABASE captures the catalog, not the
+       bytes. A restore to a point in time gives rows whose blobs may have
+       moved on. FILESTREAM, FileTable and varbinary(max) are all covered by
+       the database backup; this is not.
+     * No single security boundary. Access to the blob is governed by the
+       storage account, not by SQL Server permissions on the row.
+
+   None of that makes it wrong. It makes the throughput comparison incomplete
+   on its own.
+--------------------------------------------------------------------------- */
+USE [$(DbName)];
+GO
+
+IF OBJECT_ID('dbo.BlobUrlStore') IS NULL
+CREATE TABLE dbo.BlobUrlStore
+(
+    FileId       bigint IDENTITY(1,1) NOT NULL,
+    RunId        uniqueidentifier     NOT NULL,
+    Bucket       varchar(20)          NOT NULL,
+    FileName     nvarchar(400)        NOT NULL,
+    SizeBytes    bigint               NOT NULL,
+    -- Stored WITHOUT any SAS query string. The token is a credential with an
+    -- expiry; persisting it would both leak it and rot.
+    BlobUrl      nvarchar(1000)       NOT NULL,
+    ETag         nvarchar(100)        NULL,
+    UploadedAt   datetime2(3)         NOT NULL CONSTRAINT DF_BlobUrlStore_UploadedAt DEFAULT SYSUTCDATETIME(),
+    CONSTRAINT PK_BlobUrlStore PRIMARY KEY CLUSTERED (FileId)
+);
+GO
+
+IF NOT EXISTS (SELECT 1 FROM sys.indexes WHERE name = 'IX_BlobUrlStore_RunId_Bucket' AND object_id = OBJECT_ID('dbo.BlobUrlStore'))
+CREATE NONCLUSTERED INDEX IX_BlobUrlStore_RunId_Bucket
+    ON dbo.BlobUrlStore (RunId, Bucket) INCLUDE (SizeBytes);
+GO
+
+/* The catalog write. Deliberately one round trip and one row: this is the
+   operation being timed against the other paths' commit, so anything extra
+   here would show up as a cost the architecture does not actually have. */
+CREATE OR ALTER PROCEDURE dbo.usp_InsertBlobUrl
+    @RunId     uniqueidentifier,
+    @Bucket    varchar(20),
+    @FileName  nvarchar(400),
+    @SizeBytes bigint,
+    @BlobUrl   nvarchar(1000),
+    @ETag      nvarchar(100) = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    INSERT dbo.BlobUrlStore (RunId, Bucket, FileName, SizeBytes, BlobUrl, ETag)
+    VALUES (@RunId, @Bucket, @FileName, @SizeBytes, @BlobUrl, @ETag);
+END
+GO
+
+/* Read benchmark input: the catalog lookup that precedes every fetch. This is
+   the realistic read pattern for this architecture -- query SQL for the URL,
+   then GET the blob -- so the lookup belongs inside the measurement. */
+CREATE OR ALTER PROCEDURE dbo.usp_GetBlobUrlSample
+    @RunId uniqueidentifier = NULL,
+    @Top   int = 500000
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT TOP (@Top) BlobUrl, SizeBytes, Bucket
+    FROM dbo.BlobUrlStore
+    WHERE (@RunId IS NULL OR RunId = @RunId)
+    ORDER BY FileId;
+END
+GO
+
+CREATE OR ALTER PROCEDURE dbo.usp_GetBlobUrlSummary
+    @RunId uniqueidentifier = NULL
+AS
+BEGIN
+    SET NOCOUNT ON;
+    SELECT
+        Bucket,
+        Files   = COUNT_BIG(*),
+        TotalGB = CONVERT(decimal(18,2), SUM(SizeBytes) / 1073741824.0),
+        MinMB   = CONVERT(decimal(18,3), MIN(SizeBytes) / 1048576.0),
+        AvgMB   = CONVERT(decimal(18,3), AVG(SizeBytes * 1.0) / 1048576.0),
+        MaxMB   = CONVERT(decimal(18,3), MAX(SizeBytes) / 1048576.0),
+        Account = MIN(BlobUrl)
+    FROM dbo.BlobUrlStore
+    WHERE (@RunId IS NULL OR RunId = @RunId)
+    GROUP BY Bucket WITH ROLLUP
+    ORDER BY Bucket;
+END
+GO

@@ -29,7 +29,8 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Filestream', 'Blob', 'FileTable', 'FilestreamRead', 'BlobRead', 'FileTableRead')]
+    [ValidateSet('Filestream', 'Blob', 'FileTable', 'AzureBlob',
+                 'FilestreamRead', 'BlobRead', 'FileTableRead', 'AzureBlobRead')]
     [string] $Scenario = 'Filestream',
 
     [double] $TargetGB,
@@ -127,13 +128,15 @@ SELECT
     BlobProc    = CASE WHEN OBJECT_ID(N'$($cfg.DemoDb).dbo.usp_BeginBlobInsert', 'P')       IS NULL THEN 0 ELSE 1 END,
     FileTable   = CASE WHEN OBJECT_ID(N'$($cfg.DemoDb).dbo.FileStoreFT')                    IS NULL THEN 0 ELSE 1 END,
     FtProc      = CASE WHEN OBJECT_ID(N'$($cfg.DemoDb).dbo.usp_GetFileTableRoot', 'P')      IS NULL THEN 0 ELSE 1 END,
+    BlobUrlTable= CASE WHEN OBJECT_ID(N'$($cfg.DemoDb).dbo.BlobUrlStore')                    IS NULL THEN 0 ELSE 1 END,
+    BlobUrlProc = CASE WHEN OBJECT_ID(N'$($cfg.DemoDb).dbo.usp_InsertBlobUrl', 'P')          IS NULL THEN 0 ELSE 1 END,
     -- Directory pressure roughly halves per-file throughput once a container
     -- is full, so a run into a used container is not comparable with one into
     -- an empty container. Cheap to check, expensive to discover afterwards.
     ExistingRows = ISNULL((SELECT SUM(c.row_count) FROM sys.dm_db_partition_stats c
                            JOIN sys.objects o ON o.object_id = c.object_id
                            WHERE c.index_id IN (0,1)
-                             AND o.name IN ('FileStore','BlobStore','FileStoreFT')), 0)
+                             AND o.name IN ('FileStore','BlobStore','FileStoreFT','BlobUrlStore')), 0)
 "@
 }
 catch {
@@ -144,7 +147,11 @@ $missing = @()
 # Only demanded for the scenarios that use them: a Filestream-only run should
 # not be blocked by a missing FileTable, and vice versa.
 $needsFileTable = ($Scenario -like 'FileTable*') -or $Matrix
-if ($pre.Rows[0].FsLevel   -lt 2) { $missing += "FILESTREAM effective level is $($pre.Rows[0].FsLevel); the streaming API needs 2 or higher" }
+$needsBlobUrl   = ($Scenario -like 'AzureBlob*')
+<#  AzureBlob never touches the FILESTREAM container. The bytes go straight to
+    Azure Storage and only the catalog row lands in SQL Server, so demanding
+    FILESTREAM level 2 would block a run that does not use the feature at all. #>
+if (-not $needsBlobUrl -and $pre.Rows[0].FsLevel -lt 2) { $missing += "FILESTREAM effective level is $($pre.Rows[0].FsLevel); the streaming API needs 2 or higher" }
 if ($pre.Rows[0].DemoDb    -eq 0) { $missing += "database '$($cfg.DemoDb)' does not exist" }
 if ($pre.Rows[0].MonitorDb -eq 0) { $missing += "database '$($cfg.MonitorDb)' does not exist" }
 
@@ -154,11 +161,15 @@ if ($pre.Rows[0].DemoDb -eq 1) {
     if ($pre.Rows[0].FsContainer -eq 0) {
         $missing += "'$($cfg.DemoDb)' has no FILESTREAM filegroup -- it was created as a plain database, not by sql\02-create-database.sql"
     }
-    if ($pre.Rows[0].FsProc -eq 0)   { $missing += "'$($cfg.DemoDb)' is missing dbo.usp_BeginFileStreamInsert" }
+    if (-not $needsBlobUrl -and $pre.Rows[0].FsProc -eq 0) { $missing += "'$($cfg.DemoDb)' is missing dbo.usp_BeginFileStreamInsert" }
     if ($pre.Rows[0].BlobProc -eq 0) { $missing += "'$($cfg.DemoDb)' is missing dbo.usp_BeginBlobInsert" }
     if ($needsFileTable) {
         if ($pre.Rows[0].FileTable -eq 0) { $missing += "'$($cfg.DemoDb)' is missing the FileTable dbo.FileStoreFT" }
         if ($pre.Rows[0].FtProc -eq 0)    { $missing += "'$($cfg.DemoDb)' is missing dbo.usp_GetFileTableRoot" }
+    }
+    if ($needsBlobUrl) {
+        if ($pre.Rows[0].BlobUrlTable -eq 0) { $missing += "'$($cfg.DemoDb)' is missing the catalog table dbo.BlobUrlStore" }
+        if ($pre.Rows[0].BlobUrlProc  -eq 0) { $missing += "'$($cfg.DemoDb)' is missing dbo.usp_InsertBlobUrl" }
     }
 }
 
@@ -170,7 +181,12 @@ if ($missing.Count -gt 0) {
     throw "Run setup first (elevated):`n" +
           "    powershell.exe -ExecutionPolicy Bypass -File $ScriptDir\Setup-FilestreamPoc.ps1 -RestartSqlService -ApplyNtfsTuning"
 }
-Write-FsPocLog "Preflight OK: FILESTREAM level $($pre.Rows[0].FsLevel), $($cfg.DemoDb) and $($cfg.MonitorDb) present." 'OK'
+if ($needsBlobUrl) {
+    Write-FsPocLog "Preflight OK: $($cfg.DemoDb) and $($cfg.MonitorDb) present, blob catalog ready. FILESTREAM not required for this scenario." 'OK'
+}
+else {
+    Write-FsPocLog "Preflight OK: FILESTREAM level $($pre.Rows[0].FsLevel), $($cfg.DemoDb) and $($cfg.MonitorDb) present." 'OK'
+}
 
 <#  A used container is a different benchmark from an empty one.
 
@@ -341,6 +357,10 @@ if ($Matrix) {
         @{ Scn = 'FilestreamRead'; Prof = 'Medium' }
         @{ Scn = 'FileTableRead';  Prof = 'Medium' }
     )
+    # AzureBlob is deliberately NOT in the matrix: it needs a reachable storage
+    # account and a data-plane role assignment, and a matrix run should not fail
+    # for want of either. Run it on its own:
+    #   .\Invoke-PocRun.ps1 -Scenario AzureBlob -TargetGB 200 -Label '...'
     Write-FsPocLog "Matrix mode: $($matrixPlan.Count) runs at $($cfg.TargetGB) GB each." 'STEP'
     foreach ($m in $matrixPlan) {
         $runs += Invoke-OneRun -Scn $m.Scn -Prof $m.Prof -GB $cfg.TargetGB

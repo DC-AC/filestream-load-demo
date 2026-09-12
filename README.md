@@ -44,7 +44,7 @@ the client off the VM. Level 1 is T-SQL only, and the Win32 open fails.
 sql/
   01-instance-config.sql     FILESTREAM access level, instance checks
   02-create-database.sql     Demo DB, FILESTREAM filegroup, FileStore + BlobStore
-                             + FileStoreFT (FileTable), procs
+                             + FileStoreFT (FileTable) + BlobUrlStore, procs
   03-monitor-db.sql          FsPocMonitor: run metadata, snapshots, sampler, analysis views
   04-xevents.sql             FsPoc_Waits event session
   05-analysis.sql            Post-run report
@@ -168,9 +168,9 @@ To ingest real files instead, use `-SourcePath D:\RealFiles`.
 
 ---
 
-## The three write paths
+## The four write paths
 
-The kit measures the same synthetic workload down three different paths, which
+The kit measures the same synthetic workload down four different paths, which
 is what makes the result a decision rather than a number.
 
 | Path | How it writes | Transactional | Recovered/backed up with the DB |
@@ -178,6 +178,7 @@ is what makes the result a decision rather than a number.
 | `Filestream` | `SqlFileStream`, Win32 streaming inside a SQL transaction | yes | yes |
 | `Blob` | chunked `varbinary(max)` `.WRITE` appends over TDS | yes | yes |
 | `FileTable` | ordinary Win32 file I/O over the SMB share | **no** | yes |
+| `AzureBlob` | REST PUT to Azure Storage, then a catalog row in SQL | **no** | **no** |
 
 `FileTable` is the odd one out and the reason it is worth including. The client
 never touches a SQL connection during the write — it creates a file on the
@@ -198,8 +199,36 @@ Two things to keep honest when reading those numbers:
   client-side timings in `FsPocMonitor.dbo.IngestTiming`, which are captured
   identically for every path.
 
-Read scenarios exist for all three: `FilestreamRead`, `BlobRead`,
-`FileTableRead`. Ingest performance alone is half an answer.
+`AzureBlob` is the outlier and the reason it is worth measuring: **the bytes
+never touch the database server.** The client uploads to
+`https://<account>.blob.core.windows.net/...` and then inserts a row recording
+the URL, size and ETag — SQL Server as catalog, blob storage as store. That is
+the architecture most teams actually weigh against FILESTREAM.
+
+Three things it gives up, none of which appear in a throughput number:
+
+- **No atomicity.** The upload and the row are two systems and cannot share a
+  transaction. The kit uploads first and inserts second, so a failure leaves an
+  orphan blob rather than a row pointing at nothing — the safer failure, and
+  still one that needs a reconciliation job.
+- **No backup coherence.** `BACKUP DATABASE` captures the catalog, not the
+  bytes. The other three paths are all covered by the database backup.
+- **A different bottleneck.** It is bound by the VM's network and the storage
+  account, not by the container disk, so its number is not directly comparable
+  to the others. Compare it on architecture and cost, not on MB/s alone.
+
+Authentication is the VM's **managed identity** by default — nothing stored
+anywhere, tokens rotate on their own. The identity needs a *data-plane* role
+(`Storage Blob Data Contributor`); `Owner` and `Contributor` are control-plane
+roles and grant no blob access, which produces a 403 on every upload while the
+portal shows the identity as fully privileged. `BlobAuth = 'Sas'` with
+`FSPOC_BLOB_SAS` is the fallback.
+
+`AzureBlob` is deliberately excluded from `-Matrix`, since a matrix run should
+not fail for want of a storage account. Run it explicitly.
+
+Read scenarios exist for all four: `FilestreamRead`, `BlobRead`,
+`FileTableRead`, `AzureBlobRead`. Ingest performance alone is half an answer.
 
 ## What the kit measures
 

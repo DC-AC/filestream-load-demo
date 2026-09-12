@@ -237,12 +237,29 @@ ELSE
     EXEC dbo.usp_GetFileTableSummary;';
 EXEC sys.sp_executesql @sql;
 
+/* ==================== 7c. AZURE BLOB CATALOG =========================== */
+PRINT '';
+PRINT '--- 7c. Azure Blob catalog (SQL Server as catalog, blob as store) ---';
+PRINT '    The bytes are not in this database. These rows point at them, and';
+PRINT '    a database backup captures the pointers, not the objects.';
+SET @sql = N'
+USE [' + (SELECT TargetDb FROM dbo.PocRun WHERE RunId = @RunId) + N'];
+IF OBJECT_ID(''dbo.BlobUrlStore'') IS NULL
+    SELECT BlobCatalog = ''dbo.BlobUrlStore does not exist -- run sql\02-create-database.sql'';
+ELSE
+    EXEC dbo.usp_GetBlobUrlSummary @RunId = ''' + CONVERT(char(36), @RunId) + N''';';
+EXEC sys.sp_executesql @sql;
+
 /* ================= 8. A/B: WRITE PATHS COMPARED ======================== */
 PRINT '';
 PRINT '--- 8. Comparison across runs and write paths -----------------------';
 PRINT '    Filestream and Blob are transactional; FileTable is not, so it has';
 PRINT '    no commit to pay for. Read the gap as the cost of that guarantee,';
 PRINT '    not as a like-for-like win, unless the run used -FileTableFlush.';
+PRINT '';
+PRINT '    AzureBlob is bound by the network and the storage account, not by';
+PRINT '    the container disk, and its bytes are outside the database backup.';
+PRINT '    Compare it on cost and architecture, not on this column alone.';
 SELECT
     r.Scenario,
     r.SizeProfile,
