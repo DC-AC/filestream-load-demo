@@ -477,7 +477,30 @@ same VM, same disk, same 8 threads / 4 MB chunk / `Mixed` profile.
 
 **FileTable was 34% slower with a P95 3.5x worse.**
 
-This contradicts the expectation the path was added under. FileTable performs no
+> ### Correction: this run is confounded
+>
+> Run 5 was **not** written into an empty container. The Reset before Run 6
+> reported the container holding 323,689 files -- exactly 161,675 + 162,014, so
+> Run 4's output was still present for the whole of Run 5. Run 4 and Run 6 both
+> started empty; Run 5 did not.
+>
+> This report already establishes that a populated container costs roughly 2x
+> the per-file throughput of an empty one. Run 5's 34% deficit therefore mixes
+> FileTable's own cost with directory pressure that Run 4 never paid, and the
+> two cannot be separated from this data.
+>
+> **Treat 34% as an upper bound on FileTable's penalty, not a measurement of
+> it.** The lock timeouts below are unaffected -- those are contention in the
+> row-materialisation path and have nothing to do with how full the container
+> is -- and so is the observation that skipping the transaction relocates work
+> rather than removing it. What is not safe to quote is the size of the gap.
+>
+> A FileTable run into an empty container is needed to settle it. The preflight
+> now refuses to start a run against a non-empty container for exactly this
+> reason, which is a guard added after this run rather than before it.
+
+Setting the confound aside, the direction of the result still contradicts the
+expectation the path was added under. FileTable performs no
 transaction and no commit flush, so it should have been the cheaper of the two;
 the kit's own documentation said to expect it to win and to read the gap as the
 price of transactional consistency. On this hardware the gap runs the other way,
@@ -531,17 +554,19 @@ clean.
 
 ### What this changes
 
-For a write-heavy ingest at this concurrency, FILESTREAM with `SqlFileStream` is
-both **faster and transactional**. There is no trade to make: the non-transacted
-path costs throughput, costs tail latency, and gives up atomicity with the row.
+For a write-heavy ingest at this concurrency, FILESTREAM with `SqlFileStream`
+was both **faster and transactional** -- by an amount this run cannot pin down,
+for the reason given above. The direction is solid: the non-transacted path did
+not win despite having no commit to pay for, it carried a materially worse tail,
+and it gives up atomicity with the row.
 
 FileTable remains the right answer when the requirement is a Windows file share
 that applications write to directly. It is not the right answer for a
 high-concurrency ingest pipeline, which is what this profile models.
 
-Still unmeasured: FileTable with `-FileTableFlush` (forcing stable storage per
+Still unmeasured: FileTable into an **empty** container -- the run that actually
+sizes the gap -- FileTable with `-FileTableFlush` (forcing stable storage per
 file, matching what a FILESTREAM commit does implicitly), and the read side.
-Both would sharpen this, and neither is likely to reverse a 34% gap.
 
 ---
 
@@ -559,6 +584,7 @@ Only the disk SKU changed, converted in place: deallocate, change SKU, start.
 | P95 per file | 64.8 ms | **41.7 ms** | -36% |
 | Worst single file | 15,097 ms | 17,511 ms | **+16%** |
 | Top wait | `FILESTREAM_WORKITEM_QUEUE` | `FILESTREAM_WORKITEM_QUEUE` | unchanged |
+| Container at start | empty | empty | comparable |
 
 ### The entire gain came from small files
 
