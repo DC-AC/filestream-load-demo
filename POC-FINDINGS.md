@@ -17,11 +17,15 @@ measured.
 | 5 | **FileTable**, Premium v1 | 4 KB | B | **not empty** | 162,014 | 33m 58s | 100.5 | 79.5 | 228.0 ms | 0 client / **219 lock timeouts** |
 | 6 | Premium v2 | 4 KB | B | empty | 162,124 | 19m 46s | 172.4 | 136.7 | **41.7 ms** | 0 |
 | 7 | **FileTable**, Premium v2 | 4 KB | B | empty | 161,804 | 28m 26s | 120.0 | 94.8 | 228.9 ms | 0 client / **188 lock timeouts** |
+| 8 | **Azure Blob** + SQL catalog | n/a | C | empty | 161,981 | **11m 02s** | **309.2** | **244.5** | **45.4 ms** | 0 |
 | - | ~~Premium v1~~ | 64 KB | A | empty | - | 23m 28s | ~~144.9~~ | - | - | **INVALID** |
 
-All runs are `Filestream` (transacted `SqlFileStream`) except runs 5 and 7.
+All runs are `Filestream` (transacted `SqlFileStream`) except runs 5 and 7
+(FileTable) and run 8 (Azure Blob Storage with a SQL Server catalog). Run 8
+writes no bytes to any local disk, so cluster size does not apply to it.
 **VM A** = `Standard_E8ads_v5`, OS 20348.5256. **VM B** = a rebuild at the same
-VM size, on the same disks, same SQL build. Runs 4-6 were traced with Procmon;
+VM size, on the same disks, same SQL build. **VM C** = a third build, used only
+for run 8. Runs 4-6 were traced with Procmon;
 whether runs 1-3 were is not recorded, because `ProcmonActive` was stored as 0
 on every run until that bug was fixed.
 
@@ -54,6 +58,14 @@ time**. Expect a further disk upgrade to return less than this one did.
 
 **Four `CreateFile` calls per file written**, identical on both SKUs. Structural,
 and the second largest wait.
+
+**Azure Blob was the fastest path measured, and the reason is concurrency, not
+speed.** 309.2 MB/s against FILESTREAM's best of 296.0, on a different VM. Per
+*stream* it is the slower path above 8 MB -- it plateaus at about 60 MB/s per
+connection where FILESTREAM reaches 336 -- but it holds that 60 at every size,
+so eight streams aggregate to more than FILESTREAM manages. It also does not
+touch the container disk at all. See
+[run 8](#run-8-azure-blob-storage-with-a-sql-server-catalog).
 
 **FileTable is 30% slower than FILESTREAM, and all of it is small files.** On
 identical hardware into an empty container, FileTable doubled the cost of files
@@ -891,6 +903,106 @@ transactional consistency, not one traded for the other.
 FileTable earns its place where files are large, where concurrency is low, or
 where the requirement is a Windows share that applications write to directly.
 Above roughly 16 MB per file it is measurably the faster path.
+
+---
+
+## Run 8: Azure Blob Storage with a SQL Server catalog
+
+RunId `BC1905AC-900C-4FC7-9C55-2059550F0720`, on a third VM. The client uploads
+each file to `stblobtesteus` over the Storage REST API using the VM's managed
+identity, then inserts a row in `dbo.BlobUrlStore` recording the URL, size and
+ETag. Same `Mixed` profile, 8 threads, 4 MB chunk. No Procmon.
+
+| | Run 6: Filestream | Run 7: FileTable | Run 8: Azure Blob |
+|---|---|---|---|
+| Elapsed | 19m 46s | 28m 26s | **11m 02s** |
+| Throughput | 172.4 MB/s | 120.0 MB/s | **309.2 MB/s** |
+| Files/sec | 136.7 | 94.8 | **244.5** |
+| P95 per file | 41.7 ms | 228.9 ms | 45.4 ms |
+| Bytes on the container disk | 200 GB | 200 GB | **0** |
+| In the database backup | yes | yes | **no** |
+
+> **Different machine.** Run 8 ran on VM C; runs 6 and 7 on VM B. The blob path
+> never touches the container disk, so the disk configuration is irrelevant to
+> it -- but CPU and network are not, and those were not held constant. Read the
+> comparison as indicative.
+
+### It plateaus per stream and wins on concurrency
+
+Effective MB/s per stream:
+
+| Bucket | Filestream v2 | FileTable | **Azure Blob** |
+|---|---|---|---|
+| Tiny (0.03 MB) | 1.4 | 0.7 | **3.0** |
+| Small (0.53 MB) | 21.5 | 9.9 | **23.6** |
+| Medium (8.5 MB) | 23.0 | 22.0 | **55.5** |
+| Large (135 MB) | 55.6 | 60.4 | 60.5 |
+| Huge (~1 GB) | **336.0** | 385.6 | 62.5 |
+
+Blob sits at 55-63 MB/s across Medium, Large and Huge -- **flat**. That is a
+per-connection ceiling: one HTTPS stream to one storage account moves about
+60 MB/s no matter how large the object is. FILESTREAM has no such ceiling and
+reaches 336 MB/s per stream on a 1 GB file, because it is writing to a local
+disk.
+
+Blob still wins overall because the ceiling is *per connection*, and eight
+connections aggregate. FILESTREAM's large-file advantage cannot compensate for
+its small-file cost.
+
+Thread-time per bucket makes the trade explicit:
+
+| Bucket | Azure Blob | Filestream v2 | Change |
+|---|---|---|---|
+| Tiny | **1,332s** | 2,876s | **-54%** |
+| Small | 690s | 759s | -9% |
+| Medium | **1,106s** | 2,673s | **-59%** |
+| Large | 1,524s | 1,653s | -8% |
+| Huge | **491s** | 91s | **+438%** |
+| **Total** | **5,143s** | 8,053s | **-36%** |
+
+Blob more than halves the cost of Tiny and Medium and is **5.4x worse on Huge**.
+A 1 GB upload averaged 16.4 seconds and peaked at 33.6 -- P99 for that bucket is
+32.9 seconds, against 4.98 seconds for FILESTREAM. If the workload is dominated
+by multi-hundred-megabyte objects, this ordering reverses.
+
+(5,143 thread-seconds over 8 threads is 643s against 663s elapsed: 97% of wall
+clock accounted for by measured per-file work, the tightest of any run here.)
+
+### SQL Server does nothing but log
+
+`WRITELOG` is **99.35% of all wait time** -- 448 seconds across 163,335 waits at
+a 2.74 ms mean. Nothing else reaches 0.3%. Every FILESTREAM and FileTable wait
+type is absent, because the feature is not in use.
+
+That is the catalog insert and only the catalog insert. Measured client-side it
+costs 3.1-4.9 ms per file regardless of size, 527 thread-seconds in total --
+10% of the run's work, and the price of knowing what was stored. The log wrote
+591.7 MB for a 200 GB load.
+
+The corollary matters for capacity planning: **this path puts almost no load on
+the database server.** One log-write stream and 63.5 MB to the MDF. The same SQL
+Server could catalogue several such ingests at once.
+
+### What it costs that the number does not show
+
+- **No atomicity.** Upload and row insert are two systems. The kit uploads
+  first, so a failure leaves an orphan blob rather than a row pointing at
+  nothing -- the safer failure, and still one needing a reconciliation job.
+- **Not in the database backup.** `BACKUP DATABASE` captured 591.7 MB of log and
+  a catalog. Restoring it to a point in time gives rows whose blobs have moved
+  on independently. The other three paths are backed up with the database.
+- **A separate security boundary.** Access is governed by the storage account,
+  not by SQL Server permissions on the row.
+- **Per-operation billing.** 161,981 PUT operations for this run. Trivial at
+  this volume, but it scales with file *count*, which is exactly the dimension
+  this workload is heaviest in.
+
+### What to recommend
+
+For an ingest of many small files where the bytes do not need to live inside the
+database, this is the fastest path measured and it barely touches SQL Server.
+For large objects it is the slowest per stream by a factor of five. For anything
+where a database restore must reproduce the files, it is not a candidate at all.
 
 ---
 
