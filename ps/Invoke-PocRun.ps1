@@ -72,6 +72,9 @@ param(
 
     # Run the full comparison matrix instead of a single scenario
     [switch] $Matrix,
+    # Proceed even though the container already holds data. Only pass this when
+    # a warm container is deliberately the thing being measured.
+    [switch] $AllowUsedContainer,
     [switch] $SkipAnalysis
 )
 
@@ -123,7 +126,14 @@ SELECT
     FsProc      = CASE WHEN OBJECT_ID(N'$($cfg.DemoDb).dbo.usp_BeginFileStreamInsert', 'P') IS NULL THEN 0 ELSE 1 END,
     BlobProc    = CASE WHEN OBJECT_ID(N'$($cfg.DemoDb).dbo.usp_BeginBlobInsert', 'P')       IS NULL THEN 0 ELSE 1 END,
     FileTable   = CASE WHEN OBJECT_ID(N'$($cfg.DemoDb).dbo.FileStoreFT')                    IS NULL THEN 0 ELSE 1 END,
-    FtProc      = CASE WHEN OBJECT_ID(N'$($cfg.DemoDb).dbo.usp_GetFileTableRoot', 'P')      IS NULL THEN 0 ELSE 1 END
+    FtProc      = CASE WHEN OBJECT_ID(N'$($cfg.DemoDb).dbo.usp_GetFileTableRoot', 'P')      IS NULL THEN 0 ELSE 1 END,
+    -- Directory pressure roughly halves per-file throughput once a container
+    -- is full, so a run into a used container is not comparable with one into
+    -- an empty container. Cheap to check, expensive to discover afterwards.
+    ExistingRows = ISNULL((SELECT SUM(c.row_count) FROM sys.dm_db_partition_stats c
+                           JOIN sys.objects o ON o.object_id = c.object_id
+                           WHERE c.index_id IN (0,1)
+                             AND o.name IN ('FileStore','BlobStore','FileStoreFT')), 0)
 "@
 }
 catch {
@@ -161,6 +171,27 @@ if ($missing.Count -gt 0) {
           "    powershell.exe -ExecutionPolicy Bypass -File $ScriptDir\Setup-FilestreamPoc.ps1 -RestartSqlService -ApplyNtfsTuning"
 }
 Write-FsPocLog "Preflight OK: FILESTREAM level $($pre.Rows[0].FsLevel), $($cfg.DemoDb) and $($cfg.MonitorDb) present." 'OK'
+
+<#  A used container is a different benchmark from an empty one.
+
+    Measured at roughly 2x the per-file cost once the container is populated,
+    so a run into a container holding a previous run's data cannot be compared
+    against one into a fresh container. That is the difference between
+    measuring a disk change and measuring directory pressure.
+#>
+$existing = [long]$pre.Rows[0].ExistingRows
+if ($existing -gt 0) {
+    Write-Host ''
+    Write-FsPocLog ("The container already holds {0:N0} row(s) from previous run(s)." -f $existing) 'WARN'
+    Write-FsPocLog 'Directory pressure costs roughly 2x per-file throughput, so this run will NOT be' 'WARN'
+    Write-FsPocLog 'comparable with runs that started from an empty container.' 'WARN'
+    Write-FsPocLog 'To start clean:  .\Reset-FilestreamPoc.ps1 -Execute   (keeps the run history)' 'INFO'
+    Write-Host ''
+    if (-not $AllowUsedContainer) {
+        throw 'Aborting: the container is not empty. Reset it, or pass -AllowUsedContainer if a warm container is what you intend to measure.'
+    }
+    Write-FsPocLog 'Continuing into a used container (-AllowUsedContainer).' 'WARN'
+}
 
 # ---------------------------------------------------------------------------
 function Invoke-OneRun {
