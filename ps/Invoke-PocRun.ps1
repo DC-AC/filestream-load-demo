@@ -129,14 +129,7 @@ SELECT
     FileTable   = CASE WHEN OBJECT_ID(N'$($cfg.DemoDb).dbo.FileStoreFT')                    IS NULL THEN 0 ELSE 1 END,
     FtProc      = CASE WHEN OBJECT_ID(N'$($cfg.DemoDb).dbo.usp_GetFileTableRoot', 'P')      IS NULL THEN 0 ELSE 1 END,
     BlobUrlTable= CASE WHEN OBJECT_ID(N'$($cfg.DemoDb).dbo.BlobUrlStore')                    IS NULL THEN 0 ELSE 1 END,
-    BlobUrlProc = CASE WHEN OBJECT_ID(N'$($cfg.DemoDb).dbo.usp_InsertBlobUrl', 'P')          IS NULL THEN 0 ELSE 1 END,
-    -- Directory pressure roughly halves per-file throughput once a container
-    -- is full, so a run into a used container is not comparable with one into
-    -- an empty container. Cheap to check, expensive to discover afterwards.
-    ExistingRows = ISNULL((SELECT SUM(c.row_count) FROM sys.dm_db_partition_stats c
-                           JOIN sys.objects o ON o.object_id = c.object_id
-                           WHERE c.index_id IN (0,1)
-                             AND o.name IN ('FileStore','BlobStore','FileStoreFT','BlobUrlStore')), 0)
+    BlobUrlProc = CASE WHEN OBJECT_ID(N'$($cfg.DemoDb).dbo.usp_InsertBlobUrl', 'P')          IS NULL THEN 0 ELSE 1 END
 "@
 }
 catch {
@@ -194,8 +187,22 @@ else {
     so a run into a container holding a previous run's data cannot be compared
     against one into a fresh container. That is the difference between
     measuring a disk change and measuring directory pressure.
+
+    The count runs in the demo database, not in the master query above.
+    sys.dm_db_partition_stats and sys.objects describe only the database the
+    connection is in, so from master this counted master's tables, matched
+    none of these names, and returned 0 on every run -- the check never
+    fired, and runs went into populated containers unannounced. The database
+    is known to exist by this point: the preflight has already thrown if not.
 #>
-$existing = [long]$pre.Rows[0].ExistingRows
+$used = Invoke-FsPocSql -Instance $cfg.SqlInstance -Database $cfg.DemoDb -Query @'
+SELECT ExistingRows = ISNULL(SUM(c.row_count), 0)
+FROM sys.dm_db_partition_stats c
+JOIN sys.objects o ON o.object_id = c.object_id
+WHERE c.index_id IN (0,1)
+  AND o.name IN ('FileStore','BlobStore','FileStoreFT','BlobUrlStore')
+'@
+$existing = [long]$used.Rows[0].ExistingRows
 if ($existing -gt 0) {
     Write-Host ''
     Write-FsPocLog ("The container already holds {0:N0} row(s) from previous run(s)." -f $existing) 'WARN'

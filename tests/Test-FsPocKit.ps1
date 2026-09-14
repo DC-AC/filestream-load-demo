@@ -205,6 +205,29 @@ Assert-Ok 'No sqlcmd argument list combines -W with -y or -Y' {
     if ($bad) { throw "-W with -y/-Y at $($bad -join ', ')" }
 }
 
+# sys.objects, sys.dm_db_partition_stats and the other per-database catalog
+# views describe only the database the connection is in. Queried from master
+# they silently describe master: the preflight's used-container count did
+# exactly that and returned 0 on every run. Three-part names are fine.
+Assert-Ok 'No master-context query reads per-database catalog views' {
+    $pattern = '(?<![\w\]]\.)sys\.(objects|tables|indexes|columns|partitions|dm_db_partition_stats)\b'
+    $bad = foreach ($file in Get-ChildItem $PsRoot -Include *.ps1, *.psm1 -Recurse) {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+        foreach ($call in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Invoke-FsPocSql' }, $true)) {
+            $els = @($call.CommandElements); $db = $null; $query = $null
+            for ($i = 1; $i -lt $els.Count - 1; $i++) {
+                if ($els[$i] -isnot [System.Management.Automation.Language.CommandParameterAst]) { continue }
+                switch ($els[$i].ParameterName) {
+                    'Database' { $db    = $els[$i + 1].Extent.Text.Trim("'", '"') }
+                    'Query'    { $query = $els[$i + 1].Extent.Text }
+                }
+            }
+            if ($db -eq 'master' -and $query -match $pattern) { '{0}:{1}' -f $file.Name, $call.Extent.StartLineNumber }
+        }
+    }
+    if ($bad) { throw "per-database catalog view queried from master at $($bad -join ', ')" }
+}
+
 # The empty-string sentinel contract: an environment variable set to '' is
 # deleted by Windows, so optional values are passed as 'NONE' and the SQL must
 # recognise it. Guard both ends.
