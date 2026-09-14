@@ -188,6 +188,23 @@ foreach ($sql in Get-ChildItem $sqlRoot -Filter *.sql | Sort-Object Name) {
     else { Write-Host ("  PASS  {0} (no variables)" -f $sql.Name) -ForegroundColor Green }
 }
 
+# sqlcmd rejects -W together with -y or -Y ("mutually exclusive") and exits 1
+# before running a single batch. Case matters: -w is screen width and is fine.
+# This slipped through once in Invoke-PocRun.ps1 and again in
+# Invoke-PocAnalysis.ps1, both times costing the report after a finished load.
+Assert-Ok 'No sqlcmd argument list combines -W with -y or -Y' {
+    $bad = foreach ($file in Get-ChildItem $PsRoot -Include *.ps1, *.psm1 -Recurse) {
+        $ast = [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$null)
+        foreach ($arr in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ArrayLiteralAst] }, $true)) {
+            $opts = @($arr.Elements | Where-Object { $_ -is [System.Management.Automation.Language.StringConstantExpressionAst] } | ForEach-Object Value)
+            if (($opts -ccontains '-W') -and (($opts -ccontains '-y') -or ($opts -ccontains '-Y'))) {
+                '{0}:{1}' -f $file.Name, $arr.Extent.StartLineNumber
+            }
+        }
+    }
+    if ($bad) { throw "-W with -y/-Y at $($bad -join ', ')" }
+}
+
 # The empty-string sentinel contract: an environment variable set to '' is
 # deleted by Windows, so optional values are passed as 'NONE' and the SQL must
 # recognise it. Guard both ends.

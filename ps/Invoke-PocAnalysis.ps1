@@ -151,6 +151,10 @@ if (-not $SkipTimings -and $ResultsDir -and (Test-Path -LiteralPath $ResultsDir)
     }
 }
 
+# sqlcmd rejects -W together with -y/-Y and exits before running anything.
+# -W alone keeps wide columns whole; see the note in Invoke-PocRun.ps1.
+$AnalysisFormatArgs = @('-W', '-s', '|')
+
 # ---------------------------------------------------------------------------
 # 2. SQL analysis
 # ---------------------------------------------------------------------------
@@ -162,7 +166,7 @@ if (-not $SkipSql) {
     Invoke-FsPocSql -Instance $cfg.SqlInstance `
         -InputFile (Join-Path $sqlDir '05-analysis.sql') `
         -SqlcmdVariables @{ RunId = $RunId; TopWaits = 25 } `
-        -ExtraArgs @('-y', '0', '-Y', '40', '-W', '-s', '|') |
+        -ExtraArgs $AnalysisFormatArgs |
         Tee-Object -FilePath $out
     Write-FsPocLog "Saved to $out" 'OK'
 }
@@ -208,7 +212,7 @@ if (-not $SkipXEvents -and $ResultsDir) {
             Invoke-FsPocSql -Instance $cfg.SqlInstance `
                 -InputFile (Join-Path $sqlDir '06-xevent-shred.sql') `
                 -SqlcmdVariables @{ XePath = $xelSrc; SessionName = 'FsPoc_Waits' } `
-                -ExtraArgs @('-y', '0', '-Y', '40', '-W', '-s', '|') |
+                -ExtraArgs $AnalysisFormatArgs |
                 Tee-Object -FilePath $xeOut
             Write-FsPocLog "Saved to $xeOut" 'OK'
         }
