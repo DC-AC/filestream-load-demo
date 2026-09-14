@@ -18,9 +18,12 @@ did not measure the read path yet.
 | 6 | Premium v2 | 4 KB | B | empty | 162,124 | 19m 46s | 172.4 | 136.7 | **41.7 ms** | 0 |
 | 7 | **FileTable**, Premium v2 | 4 KB | B | empty | 161,804 | 28m 26s | 120.0 | 94.8 | 228.9 ms | 0 client / **188 lock timeouts** |
 | 8 | **Azure Blob** + SQL catalog | n/a | C | empty | 161,981 | **11m 02s** | **309.2** | **244.5** | **45.4 ms** | 0 |
+| 9 | **FileTable**, P40 (Premium v1) | 64 KB | D | empty | 161,932 | 40m 10s | 85.0 | 67.2 | 243.6 ms | not extracted / **245 lock timeouts** |
+| 10 | **FileTable**, Premium v2 | 64 KB | D | **not empty** | 162,373 | 28m 35s | 119.4 | 94.7 | 217.2 ms | not extracted / **185 lock timeouts** |
 | - | ~~Premium v1~~ | 64 KB | A | empty | - | 23m 28s | ~~144.9~~ | - | - | **INVALID** |
+| - | ~~**FileTable**, Premium v2~~ | 64 KB | D | **not empty** | 162,587 | 42m 59s | ~~79.4~~ | - | - | **NOT COMPARABLE** |
 
-Runs 5 and 7 use FileTable. Run 8 uses Azure Blob Storage with a SQL Server
+Runs 5, 7, 9 and 10 use FileTable. Run 8 uses Azure Blob Storage with a SQL Server
 catalog. All other runs use `Filestream` (transacted `SqlFileStream`). Run 8
 writes no bytes to a local disk, so cluster size does not apply to it.
 
@@ -28,14 +31,26 @@ writes no bytes to a local disk, so cluster size does not apply to it.
 - **VM B** is a rebuild of VM A. It has the same VM size, the same disks and
   the same SQL build.
 - **VM C** is a third build. Only run 8 used it.
+- **VM D** is a fourth build, with the same VM size and OS build as VM A and a
+  64 KB container volume. Runs 9 and 10 used it. Between them, the container
+  disk changed from a P40 with `ReadOnly` caching to PremiumV2 with `None`.
+  Defender real-time protection was on, with **no exclusions**.
 
 We traced runs 4 to 6 with Procmon. We do not know if we traced runs 1 to 3.
 The kit stored `ProcmonActive` as 0 on every run until we fixed that bug.
+Runs 9 and 10 ran Procmon for 120 seconds without its filter configuration, so
+the trace included every process on the machine.
 
 The invalid row stays in the table on purpose. The machine went down 25 seconds
 after that run reported completion. The data was still in the Windows file
 cache, so the disk never absorbed it. See
 [Do not quote the 144.9 MB/s figure](#do-not-quote-the-1449-mbs-figure).
+
+The second struck row ran on VM D, between runs 9 and 10. It lost about
+16 minutes to a stall in the Tiny bucket, which started shortly after an
+unfiltered Procmon trace stopped. It also started with the files of run 9 in
+the table. See
+[runs 9 and 10](#runs-9-and-10-filetable-on-vm-d-p40-then-premium-v2).
 
 ### What the numbers say
 
@@ -77,6 +92,13 @@ doubled the cost of files under 1 MB. It was slightly *cheaper* for files above
 16 MB. Its P95 was 5.5x worse. It also had 188 internal lock timeouts that the
 client did not see. See
 [run 7](#run-7-filetable-on-premium-v2-the-clean-measurement).
+
+**FileTable responds to the disk the way FILESTREAM does: through small
+files.** On VM D, the change from a P40 to PremiumV2 gave FileTable 40% more
+throughput (run 9 to run 10), although run 10 started with 340,737 files in the
+table. **Files under 1 MB gave 93% of the saved time.** Large files became 4%
+slower. That is the pattern of runs 4 to 6. See
+[runs 9 and 10](#runs-9-and-10-filetable-on-vm-d-p40-then-premium-v2).
 
 **Client-reported throughput can be higher than what the disk absorbs.** One run
 reported 144.9 MB/s for writes that were still in the Windows file cache.
@@ -132,6 +154,15 @@ explain the gap, and the allocation unit is not the cause.
 If the values are the same, cluster size is a suspect again. A 64 KB run on the
 current VM then gives the answer. The comparison costs nothing, so do it first.
 
+**Run 10 does not settle it either.** Run 10 used 64 KB and gave FileTable
+119.4 MB/s. Run 7 used 4 KB and gave 120.0 MB/s. The number of operations per
+file is the same in both. But the runs differ in more than cluster size: the VM,
+Defender exclusions, the data and log disks, and a table that already held
+340,737 files. The per-bucket shape is the same as the 37% gap. Small files did
+not change (Tiny 0.7 and 0.6 MB/s, Small 9.9 and 9.5). Large files are 13%
+slower, and Huge files are 45% slower. That points to bandwidth again, and
+nobody recorded the provisioned bandwidth of either disk.
+
 **Not tried:** the read path, `FULL` recovery, `-FileTableFlush`, and multiple
 FILESTREAM containers on different disks.
 
@@ -143,22 +174,22 @@ This table shows effective MB/s per stream, measured by the client for each
 file. It includes every run and every bucket. It is the most useful view in
 this report, and it explains every headline number above.
 
-| Bucket | Avg size | 1<br>P40 64K | 2<br>v2 64K | 3<br>v2+ 64K | 4<br>v1 4K | 6<br>v2 4K | 7<br>FileT | 8<br>Blob |
-|---|---|---|---|---|---|---|---|---|
-| Tiny | 0.03 MB | 0.7 | 1.7 | 1.8 | 0.8 | 1.4 | 0.7 | **3.0** |
-| Small | 0.53 MB | 10.1 | 24.7 | **25.8** | 12.9 | 21.5 | 9.9 | 23.6 |
-| Medium | 8.5 MB | 18.9 | 42.2 | **50.6** | 20.7 | 23.0 | 22.0 | 55.5 |
-| Large | 135 MB | 33.6 | 145.7 | **175.9** | 61.6 | 55.6 | 60.4 | 60.5 |
-| Huge | ~1 GB | 51.1 | **784.7** | 543.8 | 311.1 | 336.0 | 385.6 | 62.5 |
+| Bucket | Avg size | 1<br>P40 64K | 2<br>v2 64K | 3<br>v2+ 64K | 4<br>v1 4K | 6<br>v2 4K | 7<br>FileT | 8<br>Blob | 9<br>FileT P40 64K | 10<br>FileT v2 64K |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Tiny | 0.03 MB | 0.7 | 1.7 | 1.8 | 0.8 | 1.4 | 0.7 | **3.0** | 0.4 | 0.6 |
+| Small | 0.53 MB | 10.1 | 24.7 | **25.8** | 12.9 | 21.5 | 9.9 | 23.6 | 6.8 | 9.5 |
+| Medium | 8.5 MB | 18.9 | 42.2 | **50.6** | 20.7 | 23.0 | 22.0 | 55.5 | 20.8 | 24.8 |
+| Large | 135 MB | 33.6 | 145.7 | **175.9** | 61.6 | 55.6 | 60.4 | 60.5 | 54.6 | 52.4 |
+| Huge | ~1 GB | 51.1 | **784.7** | 543.8 | 311.1 | 336.0 | 385.6 | 62.5 | 320.6 | 214.0 |
 
 The table shows four things. The sections below give the details.
 
 - **File size has more effect than any other variable.** In each run, the
-  spread from Tiny to Huge is 70x to 460x. No disk change, write path or
+  spread from Tiny to Huge is 70x to 840x. No disk change, write path or
   configuration setting in this report changes a number by more than about 4x.
 - **The small end almost does not respond to any change.** Tiny stays between
-  0.7 and 3.0 MB/s across eight runs, four disk configurations and four write
-  paths. More money on storage does not fix a small-file workload.
+  0.4 and 3.0 MB/s across ten runs, every disk configuration and every write
+  path. More money on storage does not fix a small-file workload.
 - **Azure Blob is flat. The other paths are not.** From Medium upward, Blob
   stays at 55-63 MB/s. That is a ceiling per connection. FILESTREAM climbs to
   336-785 MB/s. Blob still wins overall, because eight connections add together.
@@ -172,8 +203,8 @@ The table shows four things. The sections below give the details.
 
 VM A ran runs 1 to 3. VM B ran runs 4 to 7. VM B is a rebuild of VM A, with the
 same size and the same disks. VM C ran run 8. It is a third build, and the blob
-path on it never touches a local disk. Only comparisons inside one group are
-controlled.
+path on it never touches a local disk. VM D ran runs 9 and 10 (see
+[VM D](#vm-d)). Only comparisons inside one group are controlled.
 
 The tables below describe VM A.
 
@@ -227,6 +258,23 @@ PremiumV2 sets throughput and IOPS separately from disk size. Both defaults are
 low. The throughput default is 125 MB/s. Someone provisioned this disk above
 the default for run 2, then increased it again for run 3. A PremiumV2 disk at
 the defaults is slower than the P40 it replaced.
+
+### VM D
+
+VM D ran runs 9 and 10. It has the same VM size and OS build as VM A.
+
+| | VM A | VM D |
+|---|---|---|
+| VM | `Standard_E8ads_v5` | `Standard_E8ads_v5` |
+| OS build | 20348.5256 | 20348.5256 |
+| SQL Server | 2019, 15.0.4470.1 | not recorded |
+| `F:` and `G:` | 1024 GB `PremiumV2_LRS` | 1024 GB `Premium_LRS`, in storage pools |
+| `H:` | see above | 2048 GB P40, `ReadOnly` (run 9); `PremiumV2_LRS`, `None` (run 10) |
+| `H:` allocation unit | 64 KB | 64 KB |
+| 8.3 names on `H:` | off | off |
+| Defender | `H:\FilestreamData` and `sqlservr.exe` excluded | real-time on, **no exclusions** |
+
+Nobody recorded the provisioned IOPS and throughput of the PremiumV2 disk.
 
 ---
 
@@ -385,6 +433,10 @@ work, four calls per file, and IOPS limits metadata work. So the conclusion
 above needs one change. At run 2, the disk stopped being a *bandwidth*
 constraint. It was still an IOPS constraint.
 
+**Runs 9 and 10 show the same for FileTable.** On VM D, the change from a P40 to
+PremiumV2 gave 40%. Files under 1 MB gave 93% of the saved time, and Large files
+became 4% slower. `PREEMPTIVE_OS_CREATEFILE` fell 56%.
+
 **Also, the ceiling has now moved off the disk.** `FILESTREAM_WORKITEM_QUEUE` is
 the FILESTREAM agent serialising file operations. It is not a disk wait. From
 run 4 to run 6, its absolute time fell 22%, but its share of all wait time
@@ -418,15 +470,15 @@ under 1 MB, most applications face that comparison. See
 These numbers come from `sys.dm_os_wait_stats` deltas over each run. Values are
 total wait time in seconds:
 
-| Wait | 1 | 2 | 3 | 4 | 6 | 7 FileT | 8 Blob |
-|---|---|---|---|---|---|---|---|
-| `FILESTREAM_WORKITEM_QUEUE` | 10,063 | 4,110 | 3,733 | 8,069 | 6,334 | - | - |
-| `PREEMPTIVE_OS_FILEOPS` | 5,445 | 2,253 | 1,911 | 4,775 | 3,601 | 1,887 | - |
-| `PREEMPTIVE_OS_CREATEFILE` | 3,785 | 1,753 | 1,580 | 4,015 | 2,786 | 1,755 | - |
-| `PREEMPTIVE_OS_DELETEFILE` | 625 | 464 | 415 | 762 | 483 | 72 | - |
-| `FFT_NSO_FCB_FIND` | - | - | - | - | - | **1,532** | - |
-| `FFT_NSO_FCB_PARENT` | - | - | - | - | - | **1,414** | - |
-| `WRITELOG` | 328 | 197 | 291 | 488 | 428 | 1,188 | **448** |
+| Wait | 1 | 2 | 3 | 4 | 6 | 7 FileT | 8 Blob | 9 FileT | 10 FileT |
+|---|---|---|---|---|---|---|---|---|---|
+| `FILESTREAM_WORKITEM_QUEUE` | 10,063 | 4,110 | 3,733 | 8,069 | 6,334 | - | - | - | - |
+| `PREEMPTIVE_OS_FILEOPS` | 5,445 | 2,253 | 1,911 | 4,775 | 3,601 | 1,887 | - | 3,136 | 2,646 |
+| `PREEMPTIVE_OS_CREATEFILE` | 3,785 | 1,753 | 1,580 | 4,015 | 2,786 | 1,755 | - | 3,023 | 1,335 |
+| `PREEMPTIVE_OS_DELETEFILE` | 625 | 464 | 415 | 762 | 483 | 72 | - | 299 | 233 |
+| `FFT_NSO_FCB_FIND` | - | - | - | - | - | **1,532** | - | 2,733 | 1,299 |
+| `FFT_NSO_FCB_PARENT` | - | - | - | - | - | **1,414** | - | 2,539 | 1,096 |
+| `WRITELOG` | 328 | 197 | 291 | 488 | 428 | 1,188 | **448** | 2,125 | 1,296 |
 
 On runs 1 to 3, the `PREEMPTIVE_OS_*` family is about 43% of wait time. It stays
 dominant through runs 4 and 6. Standard "top waits" scripts remove that family
@@ -449,15 +501,18 @@ configuration and on both allocation units:
 | 4 | 161,675 | 646,700 | 4.00 |
 | 6 | 162,124 | 648,520 | 4.00 |
 | 7 (FileTable) | 161,804 | 485,526 | 3.00 |
+| 9 (FileTable) | 161,932 | 485,900 | 3.00 |
+| 10 (FileTable) | 162,373 | 487,135 | 3.00 |
 
 The count is exactly four on five runs, three disk generations and two
-allocation units. FileTable uses exactly three. Nobody has explained either
+allocation units. FileTable uses exactly three, on three runs, two VMs, two disk generations and
+both allocation units. Nobody has explained either
 number. The Procmon traces that can explain them exist, but nobody has analysed
 them.
 
 **The two paths that do not use FILESTREAM look very different.** In run 7,
 FileTable's own namespace resolution waits (`FFT_NSO_FCB_*`) replace the
-FILESTREAM waits, at 30.7% of wait time. Run 8 has almost no waits. `WRITELOG`
+FILESTREAM waits, at 30.7% of wait time (37.2% in run 9, 29.1% in run 10). Run 8 has almost no waits. `WRITELOG`
 is **99.35%** of the total, and no other wait reaches 0.3%. In that run, SQL
 Server only logs 161,981 catalog rows.
 
@@ -569,7 +624,9 @@ list request before a run starts. So this problem fails in one second, not
 
 **These are not factors in these numbers:**
 
-- Defender (excluded).
+- Defender (excluded), except on VM D. On VM D, real-time protection was on
+  with no exclusions, so it affects runs 9 and 10. Both runs had it, so it does
+  not affect their comparison with each other.
 - 8.3 name generation (off on `H:`).
 - Volume roles (verified against the instance default paths).
 - ReFS (all volumes use NTFS).
@@ -758,9 +815,9 @@ on the same VM and the same disk. It used the same 8 threads, 4 MB chunk and
 > never had. This data cannot separate the two.
 >
 > **Use 34% as an upper limit for the FileTable penalty. It is not a
-> measurement of the penalty.** The lock timeouts below are not affected. They
-> are contention in the row-materialisation path, and the fill level of the
-> container has no effect on them. The other finding is also not affected:
+> measurement of the penalty.** The lock timeouts below are not affected. Runs 9
+> and 10 show that they arrive at about six per minute, on a timer, whatever the
+> fill level of the container. The other finding is also not affected:
 > skipping the transaction moves work, and does not remove it. Only the size of
 > the gap is not safe to quote.
 >
@@ -770,8 +827,11 @@ on the same VM and the same disk. It used the same 8 threads, 4 MB chunk and
 > It was correct to raise the caveat, but the caveat did not change the
 > conclusion.
 >
-> The preflight now refuses to start a run on a container that is not empty. We
-> added this guard after this run, not before it.
+> After this run we added a preflight guard to refuse a container that is not
+> empty. **Until 14 September 2026 the guard did not work.** It counted rows in
+> `master`, not in the demo database, so it always found zero and never refused
+> a run. It did not confirm the empty state of any run in this report. The
+> guard now counts rows in the demo database.
 
 If you ignore the confound, the direction of the result is still the opposite
 of what we expected when we added this path. FileTable does no transaction and
@@ -819,6 +879,12 @@ retries, not lost work. They are still a finding. No client-side timing or DMV
 wait delta shows them. They are the clearest signal that the FileTable
 row-materialisation path contends with itself under concurrent load. The 3.5x
 P95 penalty and these timeouts very probably have the same cause.
+
+> **Later runs change this reading.** Runs 9 and 10 show that these timeouts come
+> from a timer, not from writers that collide. A lock request that fails in less
+> than a millisecond has not waited, so these timeouts do not explain the P95
+> penalty. See
+> [the lock timeouts come from a timer](#the-lock-timeouts-come-from-a-timer).
 
 This is the strongest reason in the report to capture `error_reported` in the
 event session. A run that looks clean from the client is not always clean.
@@ -1019,8 +1085,9 @@ parallel work.
 Run 7 had 188 Msg 1222 lock timeouts. Run 5 had 219, on a different disk and a
 different container state. The rate is consistent across two runs, and the
 client did not see the timeouts either time. Both runs wrote 200.00 GB with zero
-client-side errors. This is contention in the FileTable row-materialisation
-path with concurrent writers, and it occurs again on each run.
+client-side errors. They occur on every FileTable run. Runs 9 and 10 later
+showed that they come from a timer, not from concurrent writers. See
+[the lock timeouts come from a timer](#the-lock-timeouts-come-from-a-timer).
 
 ### What to recommend
 
@@ -1139,6 +1206,133 @@ files.
 
 ---
 
+## Runs 9 and 10: FileTable on VM D, P40 then Premium v2
+
+RunIds `982D2173-D246-4BC2-959A-35FFF6F3F3C7` (run 9) and
+`1CE98887-C716-4C32-8F5C-9D1D31749E6B` (run 10), 2026-09-14, on
+[VM D](#vm-d). Both runs used FileTable, 8 threads, a 4 MB chunk, the `Mixed`
+profile and a 64 KB allocation unit. Results in
+`C:\FsPocResults\run_20260914_124957_Filetable_Mixed` and
+`run_20260914_150047_FileTable_Mixed`.
+
+Between the two runs, the container disk changed from a 2048 GB P40 with
+`ReadOnly` host caching to a 2048 GB `PremiumV2_LRS` disk with `None`. That is
+two variables, the same as the step from run 1 to run 2. Read it as "new disk
+configuration", not as "SKU alone".
+
+| | Run 9: P40 | Run 10: PremiumV2 | Change |
+|---|---|---|---|
+| Elapsed | 40m 10s | **28m 35s** | -29% |
+| Throughput | 85.0 MB/s | **119.4 MB/s** | **+40%** |
+| Files/sec | 67.2 | **94.7** | +41% |
+| P95 per file | 243.6 ms | 217.2 ms | -11% |
+| Container at start | empty | **340,737 files, 420 GB** | against run 10 |
+| Lock timeouts | 245 | 185 | see below |
+| Log written | 1,325 MB | 1,410 MB | |
+
+> **What else these two runs share, and what is not recorded**
+>
+> - Defender real-time protection was on, with **no exclusions**. It scanned
+>   both runs, so it does not affect this comparison. It does affect any
+>   comparison with runs 1 to 8.
+> - In both runs, Procmon ran for 120 seconds without its filter configuration.
+>   So it traced every process on the machine.
+> - Run 10 started with the files of run 9, of the run that is not comparable,
+>   and of a 20 GB run. If directory pressure has an effect, it works against
+>   run 10.
+> - `F:` and `G:` are `Premium_LRS`, not `PremiumV2_LRS` as on VM A.
+> - Not recorded: the provisioned IOPS and throughput of the PremiumV2 disk, the
+>   SQL Server build, `max server memory`, and client-side error counts.
+> - Neither run used `-FileTableFlush`.
+
+### Files under 1 MB gave the gain
+
+Thread time per bucket:
+
+| Bucket | Run 9: P40 | Run 10: PremiumV2 | Change |
+|---|---|---|---|
+| Tiny | 10,816s | **6,334s** | **-41%** |
+| Small | 2,397s | **1,719s** | **-28%** |
+| Medium | 2,955s | 2,473s | -16% |
+| Large | 1,688s | 1,759s | +4% |
+| Huge | 96s | 144s | +50% |
+| **Total** | **17,952s** | **12,429s** | **-31%** |
+
+**Files under 1 MB gave 93% of the saved time.** Tiny files alone gave 81%.
+Large files became 4% slower. The Huge bucket has 34 and 29 files, so do not
+read its +50% as a regression.
+
+This is the pattern of runs 4 to 6 on FILESTREAM: 95% of the saved time from
+files under 1 MB, and Large files 10% slower. The new disk helped FileTable
+through IOPS, not through bandwidth.
+
+Effective throughput per stream changed as follows: Tiny 0.4 to 0.6 MB/s, Small
+6.8 to 9.5, Medium 20.8 to 24.8, Large 54.6 to 52.4, Huge 320.6 to 214.0.
+
+### Each operation got cheaper, and the count per file did not change
+
+| Wait | Per file, run 9 | Per file, run 10 | Mean, run 9 | Mean, run 10 |
+|---|---|---|---|---|
+| `PREEMPTIVE_OS_CREATEFILE` | 3.00 | 3.00 | 6.22 ms | **2.74 ms** |
+| `FFT_NSO_FCB_FIND` | 1.80 | 2.13 | 9.37 ms | **3.75 ms** |
+| `FFT_NSO_FCB_PARENT` | 1.66 | 1.87 | 9.42 ms | **3.60 ms** |
+| `PREEMPTIVE_OS_FILEOPS` | 8.77 | 9.16 | 2.21 ms | 1.78 ms |
+| `WRITELOG` | 2.23 | 2.05 | 5.89 ms | 3.89 ms |
+| `PREEMPTIVE_OS_DELETEFILE` | 2.91 | 3.07 | 0.63 ms | 0.47 ms |
+
+`CreateFile` stays at exactly 3.00 per file. That is now true on three FileTable
+runs, two VMs, two disk generations and both allocation units. Each operation
+became 1.2x to 2.6x faster. The namespace waits (`FFT_NSO_FCB_*`) improved
+most. Their share of wait time fell from 37.2% to 29.1%. Run 7 had 30.7%.
+
+The mean `WRITELOG` wait fell 34%, but the log disk did not change. We cannot
+explain that yet.
+
+### The lock timeouts come from a timer
+
+Every FileTable run records Msg 1222 lock timeouts. In runs 5 and 7, the client
+saw none of them. Runs 9 and 10 give enough detail to show where they come from.
+
+| Run | Lock timeouts | Minutes | Per minute |
+|---|---|---|---|
+| 5 | 219 | 34.0 | 6.4 |
+| 7 | 188 | 28.4 | 6.6 |
+| 9 | 245 | 40.2 | 6.1 |
+| 10 | 185 | 28.6 | 6.5 |
+| not comparable | 204 | 43.0 | 4.7 |
+
+- **The count follows the length of the run, not the number of files.** Every
+  run wrote about 162,000 files. The rate is about six per minute on every run
+  except the one that stalled for 16 minutes.
+- **They arrive on a 20-second clock.** Runs 9, 10 and the run that is not
+  comparable had 90, 56 and 82 bursts. In each run, the bursts fall in only 3 to
+  5 of the 20 seconds of a 20-second cycle. Writers that collide at random would
+  fill almost all 20.
+- **They do not wait.** In run 10, one session recorded seven lock timeouts in
+  the same millisecond. A lock request that fails that quickly did not wait.
+- **They have no SQL text.** All of them are in `database_id` 5.
+
+So these timeouts do not come from writers that contend with each other. Most
+probably, an internal FileTable task wakes every 20 seconds, tries its locks
+without waiting, and records a timeout for each lock that it cannot get. We
+have not identified the task. The timeouts themselves cost no time, so they do
+not explain the 200 ms P95 of FileTable.
+
+### Against run 7
+
+Run 10 used 64 KB and gave 119.4 MB/s. Run 7 used 4 KB and gave 120.0 MB/s.
+The runs are on different VMs, so this does not settle the cluster-size
+question. See [What is not settled](#what-is-not-settled).
+
+### What to do next on VM D
+
+- Exclude `H:\FilestreamData` and `sqlservr.exe` from Defender before more
+  runs. Then runs on VM D compare with runs 1 to 8.
+- Record the provisioned IOPS and throughput of the PremiumV2 disk.
+- Reset the container before each run. The preflight now enforces this.
+
+---
+
 ## Not yet done
 
 1. **Find if bandwidth or cluster size causes the 37% gap.** See
@@ -1154,11 +1348,13 @@ files.
 4. **The read path.** `FilestreamRead` and `BlobRead` have not run. Ingest
    performance gives only half of the answer.
 5. **Process Monitor analysis of each operation.** Capture now works. Runs 4, 6
-   and 7 produced traces of 852 MB, 1.20 GB and 509 MB. Nobody has converted
+   and 7 produced traces of 852 MB, 1.20 GB and 509 MB. Run 10 has a 1.01 GB
+   trace without a filter, which can also show how much Defender scanned the
+   container. Nobody has converted
    them to CSV or analysed them. So there is still no NTFS-level breakdown of
    the time per file. That analysis would explain two structural counts that
    this report can state but not explain:
-   - **4.00 `CreateFile` calls per file written.**
+   - **4.00 `CreateFile` calls per file written**, and 3.00 on FileTable.
    - **2.92 `DeleteFile` calls per file** in run 4, from garbage collection
      during a load that only inserts.
 
@@ -1167,6 +1363,9 @@ files.
 6. **A batched-commit test.** In every bucket on every disk, the commit costs
    more than the write. The ingest uses one transaction per file, so nobody has
    measured the gain from batching.
+7. **The internal task behind the FileTable lock timeouts.** It wakes every
+   20 seconds and records no SQL text. Sampling `sys.dm_exec_requests` at those
+   seconds could name it.
 
 ---
 
@@ -1212,8 +1411,10 @@ The Huge bucket has 28 to 36 files per run. Use its numbers as a rough guide onl
 .\ps\Setup-FilestreamPoc.ps1 -ShowLayout
 
 # 2. Clean baseline. The container MUST be empty or directory pressure costs
-#    roughly 2x per-file throughput; the preflight now refuses to start if it
-#    is not. Reset keeps FsPocMonitor, so previous runs stay comparable.
+#    roughly 2x per-file throughput. The preflight refuses to start if it is
+#    not -- reliably only since 14 September 2026; before that the check
+#    counted rows in master and always passed. Reset keeps FsPocMonitor, so
+#    previous runs stay comparable.
 .\ps\Reset-FilestreamPoc.ps1 -Execute
 powershell.exe -ExecutionPolicy Bypass -File .\ps\Setup-FilestreamPoc.ps1 -SkipSmokeTest
 
