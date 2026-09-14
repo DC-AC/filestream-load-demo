@@ -327,4 +327,42 @@ function New-FsPocRandomPool {
     , $pool
 }
 
+# ---------------------------------------------------------------------------
+# Run artefacts
+# ---------------------------------------------------------------------------
+<#  Where a run's artefacts actually live.
+
+    The ingest records its own results folder in PocRun.Notes. Invoke-PocRun
+    then moves those files into the capture folder, beside the Perfmon,
+    Procmon and XEvent output, and deletes the ingest folder -- so for every
+    run started through Invoke-PocRun the recorded folder no longer exists.
+    The capture folder is the one whose capture-state.json carries the RunId.
+
+    Returns the recorded folder when it still exists, else the matching
+    capture folder, else the recorded path so callers can report it missing.
+#>
+function Resolve-FsPocRunFolder {
+    param(
+        [string] $NotesText,
+        [guid]   $RunId,
+        [string] $ResultsPath
+    )
+    $recorded = $null
+    if ($NotesText -and $NotesText -match 'results=(.+?)(?:;|$)') { $recorded = $Matches[1].Trim() }
+    if ($recorded -and (Test-Path -LiteralPath $recorded)) { return $recorded }
+
+    if ($RunId -ne [guid]::Empty -and $ResultsPath -and (Test-Path -LiteralPath $ResultsPath)) {
+        foreach ($dir in Get-ChildItem -LiteralPath $ResultsPath -Directory -ErrorAction SilentlyContinue) {
+            $state = Join-Path $dir.FullName 'capture-state.json'
+            if (-not (Test-Path -LiteralPath $state)) { continue }
+            try {
+                $id = (Get-Content -LiteralPath $state -Raw | ConvertFrom-Json).RunId
+                if ([guid]$id -eq $RunId) { return $dir.FullName }
+            }
+            catch { continue }
+        }
+    }
+    return $recorded
+}
+
 Export-ModuleMember -Function *-FsPoc*, Invoke-FsPocSql, Test-FsPocElevated, Format-FsPocBytes

@@ -151,6 +151,31 @@ Assert-Ok 'Random pool is the right size and actually random' {
     $distinct = @($pool[0..4095] | Select-Object -Unique).Count
     if ($distinct -lt 200) { throw "only $distinct distinct byte values in the first 4 KB - not incompressible" } }
 
+# Invoke-PocRun moves the ingest folder's files into the capture folder and
+# deletes the ingest folder that PocRun.Notes still names, so the standalone
+# analysis found no Procmon or XEvent output for any run started that way.
+Assert-Ok 'Resolve-FsPocRunFolder finds a run Invoke-PocRun moved' {
+    $root = Join-Path ([IO.Path]::GetTempPath()) ('fspoc_' + [guid]::NewGuid().ToString('N'))
+    try {
+        $id      = [guid]::NewGuid()
+        $gone    = Join-Path $root 'run_20260914_150048_FileTable'
+        $capture = Join-Path $root 'run_20260914_150047_FileTable_Mixed'
+        $other   = Join-Path $root 'run_20260914_140000_Filestream_Mixed'
+        $null = New-Item -ItemType Directory -Path $capture, $other -Force
+        @{ RunId = $id.ToString() }               | ConvertTo-Json | Set-Content (Join-Path $capture 'capture-state.json')
+        @{ RunId = [guid]::NewGuid().ToString() } | ConvertTo-Json | Set-Content (Join-Path $other 'capture-state.json')
+        $notes = "errors=0; results=$gone"
+
+        $got = Resolve-FsPocRunFolder -NotesText $notes -RunId $id -ResultsPath $root
+        if ($got -ne $capture) { throw "moved run: got '$got', expected '$capture'" }
+        $got = Resolve-FsPocRunFolder -NotesText "errors=0; results=$other" -RunId $id -ResultsPath $root
+        if ($got -ne $other) { throw "a recorded folder that exists should win: got '$got'" }
+        $got = Resolve-FsPocRunFolder -NotesText $notes -RunId ([guid]::NewGuid()) -ResultsPath $root
+        if ($got -ne $gone) { throw "no match should return the recorded path: got '$got'" }
+    }
+    finally { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
 # ---------------------------------------------------------------------------
 Write-Host ''
 Write-Host '=== 4. SQLCMD VARIABLES ===' -ForegroundColor Cyan

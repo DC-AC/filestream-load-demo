@@ -69,11 +69,6 @@ ORDER BY r.StartedAtUtc DESC
 
 if ($runs.Rows.Count -eq 0) { throw "No runs recorded in $($cfg.MonitorDb).dbo.PocRun." }
 
-function Get-RunFolder {
-    param($NotesText)
-    if ($NotesText -and $NotesText -match 'results=(.+?)(?:;|$)') { return $Matches[1].Trim() }
-    return $null
-}
 
 if ($List) {
     Write-Host ''
@@ -86,7 +81,7 @@ if ($List) {
         Write-Host ("     {0}  started {1}  {2} GB in {3} files" -f $done, $r.StartedAtUtc, $r.GB, $r.Files) -ForegroundColor Gray
         Write-Host ("     wait snapshots: {0}/2   file snapshots: {1}/2   timings: {2:N0}   samples: {3:N0}" -f `
             $r.WaitSnaps, $r.FileSnaps, $r.Timings, $r.Samples) -ForegroundColor Gray
-        $folder = Get-RunFolder $r.Notes
+        $folder = Resolve-FsPocRunFolder -NotesText $r.Notes -RunId $r.RunId -ResultsPath $cfg.ResultsPath
         if ($folder) {
             $exists = Test-Path -LiteralPath $folder
             Write-Host ("     folder: {0} {1}" -f $folder, $(if ($exists) { '' } else { '(MISSING)' })) -ForegroundColor Gray
@@ -119,7 +114,7 @@ if (-not $PSBoundParameters.ContainsKey('RunId')) {
 else { $chosen = $runs.Rows | Where-Object { [guid]$_.RunId -eq $RunId } | Select-Object -First 1 }
 if (-not $chosen) { throw "RunId $RunId not found." }
 
-if (-not $ResultsDir) { $ResultsDir = Get-RunFolder $chosen.Notes }
+if (-not $ResultsDir) { $ResultsDir = Resolve-FsPocRunFolder -NotesText $chosen.Notes -RunId $RunId -ResultsPath $cfg.ResultsPath }
 
 Write-Host ''
 Write-Host '================================================================' -ForegroundColor Cyan
